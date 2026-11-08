@@ -31,7 +31,8 @@ test("起服务 → initialize → tools/list", async () => {
   await client.start();
   const tools = await client.listTools();
   assert.deepEqual(tools.map((t) => t.name), ["echo", "fail-me", "slow", "with.image"]);
-  assert.equal(tools[0].inputSchema.required[0], "text");
+  const required = (tools[0].inputSchema as { required?: string[] }).required ?? [];
+  assert.equal(required[0], "text");
   // 服务端往 stdout 打的那行横幅应被当成噪音丢掉，而不是解析失败
   assert.equal(client.noiseLines, 1);
   await client.close();

@@ -68,10 +68,31 @@ export interface ConfirmRequest {
   detail: string;
 }
 
+/**
+ * 工具的能力标签。
+ *
+ * 用「副作用」而不是「危险等级」来描述：等级要靠人判，副作用是事实。
+ * `external` 是唯一一个特殊项——它是唯一一项无论确认模式怎么设都必须问的。
+ */
+export type Effect = "read" | "write" | "exec" | "external";
+
+/** 权限档：累进。read 只读，write 加写文件，exec 加执行命令 */
+export type Perms = "read" | "write" | "exec";
+
 export interface Tool {
   name: string;
   description: string;
   parameters: Record<string, unknown>;
+  /** 不写视为只读：漏标只会更松，所以所有带副作用的工具都必须显式标出来 */
+  effects?: Effect[];
+  /**
+   * 工具自己负责确认（而不是交给 loop 统一问）。
+   *
+   * 只有 MCP 这类需要解释「为什么这次调用特殊」的工具才用：
+   * 确认文案要说明「它跑在策略层之外」，这句话只有工具自己知道。
+   * 漏标不会导致少问一次，只会多问一次——所以默认是交给 loop。
+   */
+  selfConfirmed?: boolean;
   run(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult>;
 }
 
@@ -86,6 +107,10 @@ export type AgentEvent =
   /** 上下文被折叠：before/after 是估算 token，folded 是被折叠的消息条数 */
   | { type: "compact"; before: number; after: number; folded: number }
   | { type: "turn_end"; turn: number }
+  /** 请求失败正在重试：只会在「本次尝试没产出任何东西」时出现 */
+  | { type: "retry"; attempt: number; delayMs: number; message: string }
+  /** 需要提醒用户但不算错误（例如无人工确认下放行了写操作） */
+  | { type: "notice"; message: string }
   | { type: "agent_settled" }
   | { type: "error"; message: string; retryable: boolean }
   | { type: "aborted" }

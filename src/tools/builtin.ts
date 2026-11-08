@@ -7,7 +7,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import type { Tool, ToolContext, ToolResult } from "../types.ts";
+import type { Perms, Tool, ToolContext, ToolResult } from "../types.ts";
 import { PolicyError, resolveRead, resolveWrite, realpathLoose, isInside, redact, type Policy } from "../safety/policy.ts";
 import { guardCommand } from "../safety/exec.ts";
 
@@ -16,6 +16,12 @@ const SKIP_DIRS = new Set(["node_modules", ".git", ".feima", ".venv", "dist", "b
 
 export interface BuiltinOptions {
   policy: Policy;
+  /**
+   * 权限档，累进：read 只注册只读工具，write 加写文件，exec 加命令。
+   * 不注册而不是「注册了再拒绝」：一个必然失败的写工具留在 schema 里，
+   * 模型会反复试，几轮就把上下文烧光（v0.4 的知识库工具踩过同样的坑）。
+   */
+  perms?: Perms;
 }
 
 function str(args: Record<string, unknown>, key: string, required = true): string {
@@ -83,6 +89,7 @@ export function builtinTools(opts: BuiltinOptions): Tool[] {
 
   const readFile: Tool = {
     name: "read_file",
+    effects: ["read"],
     description: "读取工作区内的文本文件，返回带行号的正文。大文件请用 offset/limit 分段读。",
     parameters: {
       type: "object",
@@ -114,6 +121,7 @@ export function builtinTools(opts: BuiltinOptions): Tool[] {
 
   const writeFile: Tool = {
     name: "write_file",
+    effects: ["write"],
     description: "写入（覆盖）工作区内的文件，自动创建父目录。",
     parameters: {
       type: "object",
@@ -128,12 +136,16 @@ export function builtinTools(opts: BuiltinOptions): Tool[] {
       const content = typeof args.content === "string" ? args.content : str(args, "content");
       fs.mkdirSync(path.dirname(abs), { recursive: true });
       fs.writeFileSync(abs, content, "utf8");
-      return { ok: true, content: `已写入 ${path.relative(policy.workspace, abs)}（${content.length} 字符）` };
+      // 基准必须也用 realpath：Windows 上 TMP 常是 8.3 短名（ADMINI~1），
+      // 而 realpathLoose 返回长名，直接 path.relative 会算出一串 ../..，
+      // 模型看到的是「已写入 ..\..\..\Administrator\...」这种没有意义的东西
+      return { ok: true, content: `已写入 ${path.relative(realpathLoose(policy.workspace), abs)}（${content.length} 字符）` };
     },
   };
 
   const editFile: Tool = {
     name: "edit_file",
+    effects: ["write"],
     description: "精确替换文件中的一段文本。old_string 必须在文件中唯一，否则请加长上下文或使用 replace_all。",
     parameters: {
       type: "object",
@@ -164,6 +176,7 @@ export function builtinTools(opts: BuiltinOptions): Tool[] {
 
   const listDir: Tool = {
     name: "list_dir",
+    effects: ["read"],
     description: "列出目录内容，目录名带斜杠后缀。",
     parameters: {
       type: "object",
@@ -194,6 +207,7 @@ export function builtinTools(opts: BuiltinOptions): Tool[] {
 
   const glob: Tool = {
     name: "glob",
+    effects: ["read"],
     description: "按通配符查找文件，支持 * 和 **，例如 **/*.test.ts。",
     parameters: {
       type: "object",
@@ -227,6 +241,7 @@ export function builtinTools(opts: BuiltinOptions): Tool[] {
 
   const grep: Tool = {
     name: "grep",
+    effects: ["read"],
     description: "在工作区内按正则搜索文本，返回文件:行号:内容。",
     parameters: {
       type: "object",
@@ -283,6 +298,7 @@ export function builtinTools(opts: BuiltinOptions): Tool[] {
 
   const bash: Tool = {
     name: "bash",
+    effects: ["exec", "write"],
     description: "执行 shell 命令（Windows 上走 PowerShell）。输出超过上限会截断，长任务请自己加超时。",
     parameters: {
       type: "object",
@@ -304,6 +320,15 @@ export function builtinTools(opts: BuiltinOptions): Tool[] {
   };
 
   return [readFile, writeFile, editFile, listDir, glob, grep, bash];
+}
+
+/** 权限档对应的工具集合；顺序与累进语义一致，写错方向会变成「多给权限」 */
+export function filterByPerms(tools: Tool[], perms: Perms): Tool[] {
+  const writable = new Set(["write_file", "edit_file"]);
+  const execable = new Set(["bash"]);
+  if (perms === "read") return tools.filter((t) => !writable.has(t.name) && !execable.has(t.name));
+  if (perms === "write") return tools.filter((t) => !execable.has(t.name));
+  return tools;
 }
 
 export { preview };

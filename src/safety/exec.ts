@@ -22,10 +22,12 @@ import type {
   IsolationBackendId,
   RunPaths,
   SelfTestReport,
+  SpawnPlan,
 } from "./isolation.ts";
 import { createAppContainerBackend } from "./backends/appcontainer.ts";
 import { createBwrapBackend } from "./backends/bwrap.ts";
 import { createDockerBackend, DEFAULT_IMAGE } from "./backends/docker.ts";
+import { checkCommandAllowed, type AllowRule } from "./allowlist.ts";
 
 export type SandboxMode = "policy" | "strict";
 export type IsolationChoice = "auto" | IsolationBackendId;
@@ -38,6 +40,11 @@ export interface SandboxOptions {
   /** 是否允许沙盒内出网 */
   network?: boolean;
   dockerImage?: string;
+  /**
+   * 命令白名单。接在 exec 而不是工具层：任何执行命令的路径都从这里过，
+   * 将来多一个工具也不会漏掉。空数组表示不启用。
+   */
+  commandAllowlist?: AllowRule[];
   defaultTimeoutMs?: number;
   maxOutputBytes?: number;
 }
@@ -61,7 +68,7 @@ export interface Sandbox {
 
 const isWin = process.platform === "win32";
 
-function shellFor(command: string): { file: string; args: string[] } {
+function shellFor(command: string): SpawnPlan {
   if (isWin) {
     // Windows 上没有 bash 时 PowerShell 是等效通路——只封 bash 等于没封
     const ps = process.env.SYSTEMROOT
@@ -178,6 +185,13 @@ export function createSandbox(opts: SandboxOptions): Sandbox {
 
   const exec: ExecFn = (command, cwd, options = {}) =>
     new Promise((resolve, reject) => {
+      // 白名单先于一切：它管的是「这条命令该不该跑」，与隔离后端能不能跑是两件事
+      const allow = checkCommandAllowed(command, opts.commandAllowlist ?? []);
+      if (!allow.ok) {
+        reject(new PolicyError("BLOCKED_COMMAND", allow.reason));
+        return;
+      }
+
       if (opts.mode === "strict" && !backend) {
         // 这里不是"降级运行"，是拒绝：strict 的意思是"没有隔离就不许执行"
         reject(new PolicyError("NO_ISOLATION_BACKEND", `strict 模式下命令执行被拒绝：${selection.rationale}`));
@@ -292,11 +306,12 @@ export function createSandbox(opts: SandboxOptions): Sandbox {
     exec,
 
     describe(): string {
+      const gate = opts.commandAllowlist?.length ? `；白名单 ${opts.commandAllowlist.length} 条` : "";
       if (!backend) {
-        if (opts.mode === "strict") return "strict（无可用隔离后端，命令执行会被拒绝）";
-        return "policy（路径与环境变量策略生效；进程级隔离未启用）";
+        if (opts.mode === "strict") return `strict（无可用隔离后端，命令执行会被拒绝）${gate}`;
+        return `policy（路径与环境变量策略生效；进程级隔离未启用）${gate}`;
       }
-      return `${backend.id}（${backend.label}；网络${opts.network ? "放行" : "关闭"}）`;
+      return `${backend.id}（${backend.label}；网络${opts.network ? "放行" : "关闭"}）${gate}`;
     },
 
     async init(): Promise<void> {
@@ -310,6 +325,9 @@ export function createSandbox(opts: SandboxOptions): Sandbox {
           readWorkspace: false,
           denyHostRead: false,
           writeWorkspace: false,
+          // 没有后端时「列目录」也无从验证。少这一项会让这个返回值在类型上
+          // 落后于真实报告结构——v0.4 之前没人发现，因为类型检查一直是空转的
+          listWorkspace: false,
           denyHostWrite: false,
           detail: `没有隔离后端可验证：${selection.rationale}`,
         };

@@ -21,7 +21,11 @@ import { loadConfig, type FeimaConfig } from "../config.ts";
 import { buildSystemPrompt, loadProjectMemory } from "../prompt.ts";
 import { AgentLoop } from "../core/loop.ts";
 import { createOpenAIProvider } from "../providers/openai.ts";
-import { builtinTools } from "../tools/builtin.ts";
+import { builtinTools, filterByPerms } from "../tools/builtin.ts";
+import { resolveModel } from "../core/models.ts";
+import { makeSummarizer } from "../core/compact.ts";
+import { NO_RETRY, DEFAULT_RETRY } from "../core/retry.ts";
+import { parseAllowlist } from "../safety/allowlist.ts";
 import { createKnowledgeTool, knowledgeConfigured } from "../tools/knowledge.ts";
 import { parseMcpConfig } from "../mcp/client.ts";
 import { loadMcpTools } from "../mcp/tools.ts";
@@ -42,12 +46,14 @@ export async function startRpcHost(opts: Partial<FeimaConfig> = {}): Promise<num
   const config = loadConfig(opts);
   const workspace = assertWorkspace(config.workspace);
   const policy = defaultPolicy({ workspace });
+  const allow = parseAllowlist(config.cmdAllow);
   const sandbox = createSandbox({
     mode: config.sandbox,
     policy,
     isolation: config.isolation,
     network: config.network,
     dockerImage: config.dockerImage,
+    commandAllowlist: allow.rules,
   });
 
   try {
@@ -60,7 +66,7 @@ export async function startRpcHost(opts: Partial<FeimaConfig> = {}): Promise<num
     return 1;
   }
 
-  const tools = builtinTools({ policy });
+  const tools = filterByPerms(builtinTools({ policy }), config.perms);
   if (knowledgeConfigured({ url: config.knowledgeUrl })) {
     tools.push(
       createKnowledgeTool({
@@ -88,15 +94,23 @@ export async function startRpcHost(opts: Partial<FeimaConfig> = {}): Promise<num
     }
   }
 
+  const primary = resolveModel(config, config.model);
+  const compactSource = config.compactModel ? resolveModel(config, config.compactModel) : null;
+  const summarize = compactSource
+    ? makeSummarizer(
+        createOpenAIProvider({ baseUrl: compactSource.baseUrl, apiKey: compactSource.apiKey }),
+        compactSource.model,
+      )
+    : undefined;
+
   const loop = new AgentLoop({
-    provider: createOpenAIProvider({ baseUrl: config.baseUrl, apiKey: config.apiKey }),
-    model: config.model,
+    provider: createOpenAIProvider({ baseUrl: primary.baseUrl, apiKey: primary.apiKey }),
+    model: primary.model,
     tools,
     workspace,
     exec: sandbox.exec,
     // 项目约定与 CLI 走同一条路径：桌面端与终端看到的系统提示必须是同一个
     systemPrompt: buildSystemPrompt(workspace, config.systemExtra, loadProjectMemory(workspace)),
-    // RPC 宿主没有人可以问：确认闸门不装，MCP 工具因此只认 --mcp-allow 放行列表
     maxTurns: config.maxTurns,
     maxTokens: config.maxTokens,
     temperature: config.temperature,
@@ -105,7 +119,12 @@ export async function startRpcHost(opts: Partial<FeimaConfig> = {}): Promise<num
       budget: config.contextBudget,
       keepRecentTurns: config.keepRecentTurns,
       ...(config.keepTokens > 0 ? { keepTokens: config.keepTokens } : {}),
+      ...(summarize ? { summarize } : {}),
     },
+    // RPC 宿主没人可以问：确认模式要求的调用一律拒绝，除非宿主显式 --yes
+    confirmMode: config.confirm,
+    assumeYes: config.assumeYes,
+    retry: config.retries > 1 ? { ...DEFAULT_RETRY, attempts: config.retries } : NO_RETRY,
   });
 
   loop.setEventHandler((event) => writeLine({ type: "event", event }));
@@ -114,15 +133,20 @@ export async function startRpcHost(opts: Partial<FeimaConfig> = {}): Promise<num
     type: "ready",
     protocol: 1,
     workspace,
-    model: config.model,
+    model: primary.alias ? `${primary.alias} → ${primary.model}` : primary.model,
     sandbox: sandbox.describe(),
     isolated: sandbox.isolated,
+    perms: config.perms,
+    confirm: config.confirm,
+    assumeYes: config.assumeYes,
     projectMemory: loadProjectMemory(workspace)?.path ?? null,
     knowledge: knowledgeConfigured({ url: config.knowledgeUrl }),
     mcpTools: tools.filter((t) => t.name.startsWith("mcp__")).length,
     mcpNotes,
     // 桌面端要知道：MCP 工具在这里只认放行列表，发起调用前得自己确认过
     mcpConfirm: config.mcp ? "allowlist" : "off",
+    cmdAllow: allow.rules.map((r) => r.raw),
+    cmdAllowProblems: allow.problems,
   });
 
   process.stdin.setEncoding("utf8");

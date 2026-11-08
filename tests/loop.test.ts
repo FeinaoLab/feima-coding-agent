@@ -160,7 +160,9 @@ test("追加任务在自然结束后继续执行", async () => {
 });
 
 test("并发提交：第二次自动变成插话，不另起一轮", async () => {
-  let release: (() => void) | null = null;
+  // 声明时给一个空函数而不是 null：TS 只看得到同步赋值路径，
+  // 会把这个变量收窄成 never，后面调用就报「不可调用」
+  let release: () => void = () => {};
   const gate = new Promise<void>((r) => {
     release = r;
   });
@@ -188,7 +190,7 @@ test("并发提交：第二次自动变成插话，不另起一轮", async () =>
   assert.equal(second, "done", "第二次提交应立即返回，作为插话排队");
   assert.equal(loop.getSnapshot().pendingFeedback, 1);
 
-  release?.();
+  release();
   await first;
 
   assert.equal(provider.requests.length, 2);

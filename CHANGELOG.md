@@ -1,5 +1,40 @@
 # CHANGELOG
 
+## v0.5.0 — 2026-11-08
+
+从「能干活」到「在会出事的地方停一下」。这一版没有新增能力，全在加约束：重试不能带副作用，
+写文件和执行命令可以要求人工确认，命令可以收进白名单，工具可以按权限档关掉。
+
+顺带发现了一件更要紧的事：**`npm run typecheck` 从 v0.1 起就是空转的**（见「修复」第一条）。
+
+### 新增
+
+- **重试策略**（`src/core/retry.ts`）：429/5xx/连接失败按指数退避重试，默认最多 3 次尝试，带 30% 抖动。唯一的硬约束是「本次尝试没产出任何东西才允许重试」——一旦流里吐过正文或半截工具参数，立刻放弃，因为重试会把同一段话发两遍，或者把只执行了一半的命令再执行一次。重试时发 `retry` 事件，界面能显示「正在重试」而不是干等。
+- **确认闸门扩展到写文件与执行命令**（`src/safety/confirm.ts`）：`--confirm off|write|exec|external|all`。内置工具带上 `effects` 标签（read / write / exec），loop 在参数解析之后、工具执行之前问人。`write` 与 `exec` 是包含关系：能执行命令就能写文件，所以 `exec` 把写文件一起管住，反过来只开 `write` 挡不住 `bash` 写文件——这一点在帮助文本里明说，不做成「看起来更全」的假象。
+- **无确认通道时默认拒绝**：`feima run` 与 `feima rpc` 没有 stdin 可问，要求的确认一律按拒绝处理，消息里告诉模型「加 `--yes` 才能放行」并叫它不要重试。`--yes` 生效时发一次 `notice`，之后不再问。
+- **命令白名单**（`src/safety/allowlist.ts`）：`--cmd-allow "git status,git diff"`，只放行写过的命令前缀。自己按 shell 语法切段（尊重引号与转义），逐段取 argv 头部匹配——`git status; rm -rf ~` 这种整串看开头是 git 的写法会被切开，后半段单独过白名单。命令替换（`$( )`、反引号、`${ }`）与重定向一律拒。接在 `exec` 而不是工具层：任何执行路径都从这里过。
+- **权限分级**（`--perms read|write|exec`）：累进三档。`read` 只注册只读工具，`write` 加写文件，`exec` 加 `bash`。不注册而不是「注册了再拒绝」——一个必然失败的工具留在 schema 里，模型会反复试，几轮就把上下文烧光。
+- **多模型别名**（`src/core/models.ts`）：`models` 配置里写 `{ "便宜": { "model": "qwen-turbo" } }`，`--model 便宜` 即解析成对应模型与线路。别名可带自己的 `baseUrl` / `apiKey`，不写则回落到主配置。
+- **按任务选模**：`--compact-model` / `FEIMA_COMPACT_MODEL` 让上下文折叠走便宜线路。这是最实在的一处「按任务选模型」：折叠是纯体力活，用主模型额度做不划算。
+- **离线冒烟脚本**（`scripts/smoke.mjs`）：`npm run smoke`，约 3 秒。用脚本化假 provider 驱动**真实的**工具、沙盒、压缩、会话落盘，跑六个场景（写文件+执行 / 确认拒绝 / 白名单 / 压缩 / 重试 / 会话重载）。它守的是「组装起来还能不能用」。
+- `doctor` 新增四块：确认策略、权限档、命令白名单（含规则写错时的告警）、重试与压缩模型。
+
+### 修复
+
+- **`npm run typecheck` 从 v0.1 起就是空转的**：仓库没有 `typescript` 依赖，`npx tsc --noEmit` 只会打印一句「This is not the tsc command you are looking for」并以 0 退出。于是 v0.1～v0.4 里每一句「类型检查通过」都是假的。补上 `typescript` + `@types/node` 后第一次真跑就报出 20 个错误，其中三个是真的 bug：
+  - `config.ts` 里 `from "../safety/exec.ts"` 路径多了一层（类型导入会被 Node 的类型擦除删掉，所以运行时一直没炸）
+  - `Sandbox.verify()` 在「没有后端」的分支里少返回 `listWorkspace`，与 `SelfTestReport` 不一致
+  - `shellFor()` 的返回类型没带 `env`，`planned.env` 在类型上是 `never`
+- **Windows 上短路径会把相对路径算成 `..\..\..`**：`%TEMP%` 常是 8.3 短名（`ADMINI~1`），`realpathLoose` 返回长名，两边直接 `path.relative` 会得到一串 `..\..\..\Administrator\...`。模型看到的是这种没有意义的东西，还以为写到了工作区外。基准改用 `realpathLoose(policy.workspace)`。这是冒烟脚本抓到的，单元用例抓不到——它们不跑真的临时目录。
+- **`splitCommands` 不认双引号里的 `\"`**：`echo "他说 \"你好; 再见\""` 会被从中间切开，多出一段不存在的命令。虽然切开的结果是被拒（fail-closed），但拒绝理由会指错地方。双引号内的反斜杠按 POSIX 处理转义，单引号内保持字面量。
+- **MCP 的确认与内置工具的确认会问两遍**：`external` 仍然必须问，但加了 `selfConfirmed` 标记——MCP 工具自己负责问（只有它知道要说明「跑在策略层之外」），loop 不再重复问一遍。
+
+### 测试
+
+153 例（策略 7 / 循环 12 / 执行 4 / 压缩 13 / 会话 9 / 长任务 3 / 参数 12 / 隔离 8 / 约定 6 / 知识库 11 / MCP 14 / 重试 13 / 确认 14 / 白名单 16 / 模型 7 / 权限 4），全部离线。
+
+真机验证：`npm run smoke` 六场景全过（约 3 秒）；`feima doctor` 如实打印确认策略、权限档、白名单与重试状态；`doctor --confirm exec --perms read --cmd-allow "echo,git status" --retries 0` 四项参数都真的进了运行时（「解析出来没人用」这类 bug 每次都靠这条手工核对兜住）。
+
 ## v0.4.0 — 2026-11-08
 
 从「只在自己的一亩地里干活」到「能读外部知识、能守项目规矩、能接外部工具」。三件事的共同点是都得过安全关：知识库要截断，项目约定不能提权，MCP 默认关闭且逐次确认。

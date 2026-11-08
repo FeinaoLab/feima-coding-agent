@@ -20,6 +20,18 @@ export interface CliFlags {
   mcp?: boolean;
   mcpConfigFile?: string;
   mcpAllow?: string[];
+  /** 哪些副作用要确认：off / write / exec / external / all */
+  confirm?: "off" | "write" | "exec" | "external" | "all";
+  /** 无人工确认时放行 */
+  yes?: boolean;
+  /** 权限档 */
+  perms?: "read" | "write" | "exec";
+  /** 命令白名单，多次出现累加 */
+  cmdAllow?: string[];
+  /** 压缩摘要用哪个模型 */
+  compactModel?: string;
+  /** 总尝试次数；0 表示关闭重试 */
+  retries?: number;
   rest: string[];
 }
 
@@ -34,6 +46,11 @@ const VALUED = [
   "--kb-token",
   "--mcp-config",
   "--mcp-allow",
+  "--confirm",
+  "--perms",
+  "--cmd-allow",
+  "--compact-model",
+  "--retries",
 ] as const;
 type Valued = (typeof VALUED)[number];
 
@@ -50,6 +67,7 @@ export function parseFlags(rest: string[]): CliFlags {
     else if (a === "--no-save") out.noSave = true;
     else if (a === "--network") out.network = true;
     else if (a === "--mcp") out.mcp = true;
+    else if (a === "--yes" || a === "-y") out.yes = true;
     else if ((VALUED as readonly string[]).includes(a)) {
       const value = rest[i + 1];
       // 缺值时报错，不静默变成 undefined：否则 `--workspace` 写在末尾就等于没写
@@ -89,6 +107,37 @@ export function parseFlags(rest: string[]): CliFlags {
             .map((x) => x.trim())
             .filter(Boolean);
           break;
+        case "--confirm":
+          if (!["off", "write", "exec", "external", "all"].includes(value)) {
+            throw new Error("--confirm 只接受 off / write / exec / external / all");
+          }
+          out.confirm = value as CliFlags["confirm"];
+          break;
+        case "--perms":
+          if (!["read", "write", "exec"].includes(value)) {
+            throw new Error("--perms 只接受 read / write / exec（累进：read 只读，write 加写文件，exec 加命令）");
+          }
+          out.perms = value as CliFlags["perms"];
+          break;
+        case "--cmd-allow":
+          // 逗号分隔，并且允许多次出现累加：规则一多，一行写不完
+          out.cmdAllow = [
+            ...(out.cmdAllow ?? []),
+            ...value
+              .split(",")
+              .map((x) => x.trim())
+              .filter(Boolean),
+          ];
+          break;
+        case "--compact-model":
+          out.compactModel = value;
+          break;
+        case "--retries": {
+          const n = Number(value);
+          if (!Number.isInteger(n) || n < 0 || n > 6) throw new Error("--retries 只接受 0～6 的整数（总尝试次数）");
+          out.retries = n;
+          break;
+        }
       }
       i++;
     } else out.rest.push(a);

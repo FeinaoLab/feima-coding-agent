@@ -26,6 +26,7 @@ import type {
   Usage,
 } from "../types.ts";
 import { PolicyError, redact } from "../safety/policy.ts";
+import { confirmTitle, needsConfirm, summarizeArgs, type ConfirmMode } from "../safety/confirm.ts";
 import { ToolCallAssembler } from "../providers/openai.ts";
 import { preview } from "../tools/builtin.ts";
 import {
@@ -34,6 +35,7 @@ import {
   makeSummarizer,
   type CompactConfig,
 } from "./compact.ts";
+import { DEFAULT_RETRY, withRetry, type RetryPolicy } from "./retry.ts";
 
 const TRUNCATED_NOTE =
   "错误：上一次输出达到长度上限，工具参数可能被截断，本次调用未执行。请缩短参数（例如分次写入或减少改动量）后重新调用。";
@@ -43,6 +45,18 @@ const TRUNCATED_EMPTY_NOTE =
   "请直接开始执行，不要长篇推理；如果任务较大，先做第一步。";
 
 export type LoopOutcome = "done" | "aborted" | "error";
+
+/**
+ * 中断信号。
+ * 不用「检查 signal.aborted 然后 return」：重试层会把 return 当成正常结束，
+ * 抛出才能让 withRetry 立刻停手、把控制权交回给 submit。
+ */
+class AbortedError extends Error {
+  constructor() {
+    super("已中止");
+    this.name = "AbortedError";
+  }
+}
 
 export interface LoopOptions {
   provider: Provider;
@@ -59,6 +73,16 @@ export interface LoopOptions {
   compaction?: CompactConfig;
   /** 外部动作的确认闸门。不传时 MCP 之类的外部工具会按「无人确认」拒绝执行 */
   confirm?: (req: ConfirmRequest) => Promise<boolean>;
+  /** 哪些副作用需要确认；默认 off，只保留 external 的硬规则 */
+  confirmMode?: ConfirmMode;
+  /**
+   * 没有确认闸门时是否放行。
+   * 默认 false：非交互场景（run / rpc）没人能回答问题，按拒绝处理才对。
+   * 只有用户显式 --yes 才置 true，并且会在第一次放行时发一条 notice。
+   */
+  assumeYes?: boolean;
+  /** 请求重试策略；不传用默认（3 次，指数退避） */
+  retry?: RetryPolicy;
   /** 消息流钩子：会话落盘、审计、GUI 历史同步都接这里 */
   onRecord?: (record: LoopRecord) => void;
 }
@@ -74,6 +98,8 @@ export class AgentLoop {
   private compactions = 0;
   private controller: AbortController | null = null;
   private lastUsage: Usage | null = null;
+  /** --yes 只提示一次，不然每个工具调用都刷一行 */
+  private warnedNoGate = false;
 
   constructor(opts: LoopOptions) {
     this.opts = opts;
@@ -335,11 +361,18 @@ export class AgentLoop {
     | { kind: "aborted" }
     | { kind: "error"; message: string; retryable: boolean }
   > {
-    const assembler = new ToolCallAssembler();
+    let assembler = new ToolCallAssembler();
     let text = "";
     let finish: string | undefined;
     const controller = new AbortController();
     this.controller = controller;
+
+    /**
+     * 本次尝试有没有往外吐过东西。
+     * 它是「能不能重试」的唯一依据：吐过就意味着用户已经看到了一部分回答，
+     * 或者半截工具参数已经拼进 assembler，重试会重复输出、重复执行。
+     */
+    let produced = false;
 
     const schemas: ToolSchema[] = this.opts.tools.map((t) => ({
       type: "function",
@@ -347,30 +380,56 @@ export class AgentLoop {
     }));
 
     try {
-      for await (const evt of this.opts.provider.stream({
-        // 传副本：上游实现若顺手 push 了消息，不该污染我们的历史
-        messages: this.messages.slice(),
-        tools: schemas,
-        model: this.opts.model,
-        temperature: this.opts.temperature,
-        maxTokens: this.opts.maxTokens,
-        signal: controller.signal,
-      })) {
-        if (controller.signal.aborted) return { kind: "aborted" };
-        if (evt.text) {
-          text += evt.text;
-          this.emit({ type: "text_delta", text: evt.text });
-        }
-        if (evt.reasoning) this.emit({ type: "reasoning_delta", text: evt.reasoning });
-        if (evt.toolCall) assembler.feed(evt.toolCall);
-        if (evt.finish) finish = evt.finish;
-        if (evt.usage) {
-          this.lastUsage = evt.usage;
-          this.emit({ type: "usage", usage: evt.usage });
-        }
-      }
+      await withRetry(
+        async () => {
+          // 理论上只有「什么都没产出」时才会重试；重置是为了让这条不变量显式，
+          // 万一将来放宽了判断，宁可从零重来也不要把两段输出拼在一起。
+          assembler = new ToolCallAssembler();
+          text = "";
+          finish = undefined;
+
+          for await (const evt of this.opts.provider.stream({
+            // 传副本：上游实现若顺手 push 了消息，不该污染我们的历史
+            messages: this.messages.slice(),
+            tools: schemas,
+            model: this.opts.model,
+            temperature: this.opts.temperature,
+            maxTokens: this.opts.maxTokens,
+            signal: controller.signal,
+          })) {
+            if (controller.signal.aborted) throw new AbortedError();
+            if (evt.text) {
+              produced = true;
+              text += evt.text;
+              this.emit({ type: "text_delta", text: evt.text });
+            }
+            if (evt.reasoning) {
+              produced = true;
+              this.emit({ type: "reasoning_delta", text: evt.reasoning });
+            }
+            if (evt.toolCall) {
+              produced = true;
+              assembler.feed(evt.toolCall);
+            }
+            if (evt.finish) finish = evt.finish;
+            if (evt.usage) {
+              this.lastUsage = evt.usage;
+              this.emit({ type: "usage", usage: evt.usage });
+            }
+          }
+        },
+        {
+          policy: this.opts.retry ?? DEFAULT_RETRY,
+          isRetryable: (err) =>
+            err instanceof AbortedError ? false : Boolean((err as { retryable?: boolean })?.retryable),
+          hasSideEffect: () => produced,
+          onRetry: (info) =>
+            this.emit({ type: "retry", attempt: info.attempt, delayMs: info.delayMs, message: info.message }),
+          signal: controller.signal,
+        },
+      );
     } catch (err) {
-      if (controller.signal.aborted) return { kind: "aborted" };
+      if (controller.signal.aborted || err instanceof AbortedError) return { kind: "aborted" };
       const retryable = Boolean((err as { retryable?: boolean })?.retryable ?? true);
       const message = redact(err instanceof Error ? err.message : String(err));
       return { kind: "error", message, retryable };
@@ -385,6 +444,44 @@ export class AgentLoop {
       ...(calls.length ? { tool_calls: calls } : {}),
     };
     return { kind: "ok", message, finish };
+  }
+
+  /**
+   * 问人要不要执行这个有副作用的调用。
+   *
+   * 没有人可问时默认拒绝，这是刻意的：`feima run` 和 `feima rpc` 里没有 stdin 交互，
+   * 静默放行等于把「确认」变成了摆设。要放行只能显式 `--yes`，并且会提示一次。
+   */
+  private async askConfirm(
+    tool: Tool,
+    toolName: string,
+    args: Record<string, unknown>,
+  ): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const title = confirmTitle(toolName, tool.effects);
+    const detail = summarizeArgs(toolName, args);
+
+    const gate = this.opts.confirm;
+    if (!gate) {
+      if (!this.opts.assumeYes) {
+        return {
+          ok: false,
+          reason:
+            `当前是「${this.opts.confirmMode}」确认模式，但这条通道没有可交互的确认入口，` +
+            `按拒绝处理（要放行请加 --yes）`,
+        };
+      }
+      if (!this.warnedNoGate) {
+        this.warnedNoGate = true;
+        this.emit({
+          type: "notice",
+          message: `--yes 生效：${detail ? "写操作与命令执行将直接放行，不再询问" : "不再询问"}`,
+        });
+      }
+      return { ok: true };
+    }
+
+    const allowed = await gate({ title, detail });
+    return allowed ? { ok: true } : { ok: false, reason: `用户拒绝执行：${title}` };
   }
 
   private async runTool(call: ToolCall): Promise<string> {
@@ -403,6 +500,17 @@ export class AgentLoop {
     }
 
     this.emit({ type: "tool_start", id: call.id, name: call.name, args: call.arguments });
+
+    // 确认闸门在参数解析之后、执行之前：位置很关键，
+    // 提前问就看不到参数，推后问就等于先做了再问。
+    const mode = this.opts.confirmMode ?? "off";
+    if (tool.selfConfirmed !== true && needsConfirm(tool.effects, mode)) {
+      const decision = await this.askConfirm(tool, call.name, args);
+      if (!decision.ok) {
+        this.emit({ type: "tool_end", id: call.id, name: call.name, ok: false, preview: decision.reason });
+        return `错误：${decision.reason}`;
+      }
+    }
 
     try {
       const result = await tool.run(args, {

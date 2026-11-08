@@ -59,7 +59,7 @@ FEIMA_BASE_URL=http://localhost:11434/v1 FEIMA_API_KEY=ollama FEIMA_MODEL=qwen3:
 | `feima resume [id\|last]` | 恢复会话，把历史带回来继续 |
 | `feima sessions` | 列出会话（`--json` 可解析，`rm <id>` 删除） |
 | `feima rpc` | 常驻进程，stdin/stdout 收发 JSON 行，供桌面端驱动 |
-| `feima doctor` | 体检：配置、策略、各隔离后端探测 + 真自检、会话目录、上下文预算、项目约定、知识库检索探针、MCP 子进程 |
+| `feima doctor` | 体检：配置、策略、各隔离后端探测 + 真自检、会话目录、上下文预算、项目约定、知识库检索探针、MCP 子进程、确认策略、权限档、命令白名单、重试 |
 | `feima init` | 生成 `~/.feima/config.json` 模板 |
 
 交互模式里的斜杠命令：
@@ -115,16 +115,18 @@ FEIMA_BASE_URL=http://localhost:11434/v1 FEIMA_API_KEY=ollama FEIMA_MODEL=qwen3:
 
 ## 内置工具
 
-| 工具 | 说明 | 约束 |
-| --- | --- | --- |
-| `read_file` | 带行号读文件，支持分段 | 只能读工作区内、且不在 denyRead 列表 |
-| `write_file` | 写入或覆盖 | 只能写工作区内、且不在 denyWrite 列表 |
-| `edit_file` | 精确替换，要求唯一匹配 | 同上 |
-| `list_dir` | 列目录 | 只读 |
-| `glob` | 通配符找文件 | 只读 |
-| `grep` | 正则搜内容 | 只读 |
-| `bash` | 执行命令（Windows 走 PowerShell） | 命令策略过滤 + 执行层超时杀进程 |
-| `search_knowledge` | 检索飞链知识库，返回带编号的片段 | 未配置就不注册；单条截断 400 字 |
+| 工具 | 说明 | 副作用 | 约束 |
+| --- | --- | --- | --- |
+| `read_file` | 带行号读文件，支持分段 | 读 | 只能读工作区内、且不在 denyRead 列表 |
+| `write_file` | 写入或覆盖 | 写 | 只能写工作区内、且不在 denyWrite 列表 |
+| `edit_file` | 精确替换，要求唯一匹配 | 写 | 同上 |
+| `list_dir` | 列目录 | 读 | 只读 |
+| `glob` | 通配符找文件 | 读 | 只读 |
+| `grep` | 正则搜内容 | 读 | 只读 |
+| `bash` | 执行命令（Windows 走 PowerShell） | 执行 + 写 | 命令策略过滤 + 可选白名单 + 执行层超时杀进程 |
+| `search_knowledge` | 检索飞链知识库，返回带编号的片段 | 读 | 未配置就不注册；单条截断 400 字 |
+
+「副作用」这一列不是文档装饰：`--confirm write` 与 `--confirm exec` 按它决定问不问人，`--perms read|write|exec` 按它决定注不注册。
 
 外部工具（MCP）不在这张表里：要显式打开，且每次调用都要确认，见下文。
 
@@ -203,6 +205,8 @@ feima run "..." --mcp-allow everything.get-sum   # 非交互模式：显式放�
 | 写入黑名单 | `.git/hooks`、`.git/config`、`node_modules`、`.agents`、`.codex` |
 | 环境变量白名单 | 子进程只拿到 16 类变量，API Key 一律不传 |
 | 命令策略 | 拦 `rm -rf /`、强推、`curl \| sh` 等破坏性指令 |
+| 命令白名单（可选） | 开了就只放行写过的命令前缀；分号、管道、命令替换、重定向都逐段校验 |
+| 副作用确认（可选） | 写文件 / 执行命令前问人；外部工具无论如何都问 |
 | 失败即阻断 | 自检不通过就拒绝执行，不静默降级 |
 | 错误脱敏 | `sk-…`、`Bearer …`、`ghp_…` 在展示/落日志前统一抹掉 |
 | 超时与进程组 | 命令超时按进程树杀掉，不留孤儿 |
@@ -226,6 +230,57 @@ feima sandbox grant                        # Windows：给上级目录授权（�
 默认网络关闭（`FEIMA_NETWORK=1` 或 `--network` 才放行）。命令输出在 `files` 模式下走工作区里的 `.feima-tmp/`，由后端决定，对工具层透明。
 
 **自检是五件事，不是四件**：读工作区诱饵、读宿主家目录诱饵被拒、写工作区、写宿主家目录被拒、**列目录必须成功**。最后一项是踩出来的——前四项全绿、`dir` 全被拒，因为前四项用的是已建立的 cwd 句柄，绕过了路径解析。
+
+## 运行时闸门（v0.5）
+
+四个开关管住「什么时候不许动」。默认全部最宽松，需要时逐级收紧。
+
+```bash
+# 写文件与执行命令都先问一句（交互模式弹提示，非交互模式直接拒绝）
+feima --confirm exec
+
+# 非交互场景（run / rpc）没人可问，要放行必须显式 --yes
+feima run "跑测试" --confirm exec --yes
+
+# 只读审查：不注册 write_file / edit_file / bash
+feima run "审一遍 src/ 有没有逻辑漏洞" --perms read
+
+# 命令白名单：只允许写过的前缀
+feima --cmd-allow "git status,git diff,npm test" --confirm exec
+```
+
+| 开关 | 取值 | 说明 |
+| --- | --- | --- |
+| `--confirm` | `off`（默认）/ `write` / `exec` / `external` / `all` | `exec` 是 `write` 的超集：能执行命令就能写文件，所以它把写文件一起管住。反过来只开 `write` **挡不住** `bash` 写文件——这是能力上的事实，帮助文本里写明了 |
+| `--yes` | 标志 | 需要确认但没有交互通道时放行。只对 `run` / `rpc` 有意义，且会发一条 `notice` 留痕 |
+| `--perms` | `read` / `write` / `exec`（默认） | 累进。「不注册」而不是「注册了再拒绝」：一个必然失败的工具留在列表里，模型会反复试，几轮就把上下文烧光 |
+| `--cmd-allow` | 逗号分隔 | 可多次累加。命令按 shell 语法切段校验，`git status; rm -rf ~` 的后半段会单独过白名单 |
+| `--retries` | 0～6（默认 3） | 总尝试次数。只有「连不上、还没吐出第一个字节」的失败才重试——吐过正文或半截工具参数就不再重试，否则会重复输出、重复执行 |
+
+**外部工具（MCP）不受 `--confirm off` 影响**：它跑在策略层之外，飞码不知道它拿什么凭据、能访问什么，所以无条件逐次确认。这一条是刻意的，没有留关掉的口子。
+
+## 多模型与按任务选模
+
+`~/.feima/config.json` 里写别名，命令行只写自己的习惯：
+
+```json
+{
+  "models": {
+    "快":   { "model": "qwen-turbo" },
+    "远程": { "model": "claude-sonnet-4", "baseUrl": "https://api.other/v1", "apiKey": "sk-…" }
+  },
+  "compactModel": "快"
+}
+```
+
+```bash
+feima --model 远程 run "重构这个模块"
+feima --compact-model 快 run "长任务：跑一天也没关系"
+```
+
+别名不带 `baseUrl` / `apiKey` 时回落到主配置——大多数别名只是同一网关下的不同模型名，强制写全等于把配置写两遍。
+
+`compactModel` 是「按任务选模型」里最实在的一处：折叠上下文是纯体力活，用主模型的额度做不划算。
 
 ## 架构
 
@@ -254,15 +309,20 @@ src/
   core/loop.ts        双循环与状态机
   core/compact.ts     上下文压缩与 token 估算
   core/session.ts     会话持久化
+  core/retry.ts       重试与退避（带副作用判断）
+  core/models.ts      模型别名解析
   providers/openai.ts SSE 流式与工具调用拼装
-  tools/builtin.ts    7 个内置工具
+  tools/builtin.ts    7 个内置工具与权限档过滤
   tools/knowledge.ts  飞链 RAG 检索工具
   mcp/client.ts       MCP stdio 客户端（initialize / tools/list / tools/call）
   mcp/tools.ts        把 MCP 工具包成飞码工具，含逐次确认闸门
   safety/policy.ts    路径与环境变量策略、脱敏
   safety/exec.ts      执行器、握手、命令过滤
+  safety/confirm.ts   副作用确认（模式、参数摘要、脱敏）
+  safety/allowlist.ts 命令白名单（切分、前缀匹配、拒绝元字符）
   rpc/host.ts         JSONL 协议宿主
-tests/                node:test，95 个用例
+tests/                node:test，153 个用例
+scripts/smoke.mjs    离线冒烟：六场景，约 3 秒
 docs/                 立项书、架构、路线图、决策记录
 EVOLUTION.md          版本演进台账
 ```
@@ -270,12 +330,21 @@ EVOLUTION.md          版本演进台账
 ## 开发
 
 ```bash
-npm test          # 95 个用例，全部离线，不联网
+npm test          # 153 个用例，全部离线，不联网
+npm run smoke     # 离线冒烟：六场景跑完整链路，约 3 秒
+npm run typecheck # tsc --noEmit（typescript 是开发依赖）
 npm run doctor
-npm run typecheck # 需要另装 typescript（可选，开发期依赖）
 ```
 
-类型擦除只删类型不检查类型，所以**测试是唯一的守门人**，新增能力必须带用例。
+三道检查各守一段，缺一不可：
+
+| 检查 | 守什么 | 什么时候跑 |
+| --- | --- | --- |
+| `npm test` | 单个函数 / 模块对不对 | 每次改代码 |
+| `npm run smoke` | 装起来还能不能用 | 提交前 |
+| `npm run typecheck` | 类型与导入路径一致性 | 提交前 |
+
+Node 的类型擦除只删类型、不检查类型，所以**类型检查与用例是两件事，都需要**。v0.1～v0.4 的 `typecheck` 脚本因为没装 `typescript` 而一直空转（`npx` 找不到包时只打印一句提示并以 0 退出），那四个版本里「类型检查通过」都不成立；v0.5 补上依赖，第一次真跑就报出 20 个问题。教训写在 `AGENTS.md`：**新增任何检查手段，先证明它在故意写错时确实会红。**
 
 ## 路线
 
@@ -283,8 +352,8 @@ v0.1：核心循环、工具、策略层安全、CLI、RPC。
 v0.2：上下文压缩、会话持久化。
 v0.2.1：长任务验收补做，修掉「单轮长工具链不压缩」「空输出截断判完成」「`--workspace` 失效」。
 v0.3：隔离后端——AppContainer / bubblewrap / docker，真探针式自检。
-v0.4（当前）：飞链 RAG 检索、AGENTS.md 自动载入、MCP 客户端（默认关、逐次确认）。
-v0.5：重试策略、多模型别名、命令白名单。
+v0.4：飞链 RAG 检索、AGENTS.md 自动载入、MCP 客户端（默认关、逐次确认）。
+v0.5（当前）：重试、副作用确认、命令白名单、权限档、多模型别名、离线冒烟。
 v1.0：Electron 桌面端，复用 `feima rpc`，不重写引擎。
 
 详见 `docs/02-路线图.md`。

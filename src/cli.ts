@@ -22,7 +22,11 @@ import { AgentLoop } from "./core/loop.ts";
 import { SessionStore, defaultSessionDir } from "./core/session.ts";
 import { estimateMessages } from "./core/compact.ts";
 import { createOpenAIProvider } from "./providers/openai.ts";
-import { builtinTools } from "./tools/builtin.ts";
+import { builtinTools, filterByPerms } from "./tools/builtin.ts";
+import { resolveModel } from "./core/models.ts";
+import { makeSummarizer } from "./core/compact.ts";
+import { NO_RETRY, DEFAULT_RETRY } from "./core/retry.ts";
+import { parseAllowlist } from "./safety/allowlist.ts";
 import { createKnowledgeTool, knowledgeConfigured } from "./tools/knowledge.ts";
 import { parseMcpConfig, type McpClient } from "./mcp/client.ts";
 import { loadMcpTools } from "./mcp/tools.ts";
@@ -33,7 +37,7 @@ import { startRpcHost } from "./rpc/host.ts";
 import { parseFlags } from "./cli/flags.ts";
 import type { AgentEvent, ChatMessage } from "./types.ts";
 
-const VERSION = "0.4.0";
+const VERSION = "0.5.0";
 
 interface Runtime {
   config: ReturnType<typeof loadConfig>;
@@ -46,6 +50,12 @@ interface Runtime {
   knowledge: boolean;
   /** MCP 装载过程中的说明与失败原因，启动横幅与 doctor 共用 */
   mcpNotes: string[];
+  /** 白名单解析问题（写错规则时告诉用户，而不是悄悄少一条） */
+  allowNotes: string[];
+  /** 权限档与生效工具数，横幅与 doctor 共用 */
+  perms: { level: string; tools: number };
+  /** 实际用的模型标识（别名解析后），与配置里写的名字可能不同 */
+  modelLabel: string;
   /** 收尾：关掉 MCP 子进程 */
   dispose: () => Promise<void>;
 }
@@ -57,12 +67,15 @@ async function buildRuntime(session: SessionStore | null, opts: RuntimeOpts = {}
   const config = loadConfig(opts);
   const ws = assertWorkspace(config.workspace);
   const policy = defaultPolicy({ workspace: ws });
+
+  const allow = parseAllowlist(config.cmdAllow);
   const sandbox = createSandbox({
     mode: config.sandbox,
     policy,
     isolation: config.isolation,
     network: config.network,
     dockerImage: config.dockerImage,
+    commandAllowlist: allow.rules,
   });
   await sandbox.init();
   const verify = await handshake(sandbox);
@@ -73,7 +86,8 @@ async function buildRuntime(session: SessionStore | null, opts: RuntimeOpts = {}
   process.once("exit", () => void sandbox.dispose());
 
   const memory = loadProjectMemory(ws);
-  const tools = builtinTools({ policy });
+  // 权限档在这里落地：不注册而不是注册了再拒，模型才不会反复试一个必然失败的工具
+  const tools = filterByPerms(builtinTools({ policy }), config.perms);
 
   if (knowledgeConfigured({ url: config.knowledgeUrl })) {
     tools.push(
@@ -110,11 +124,22 @@ async function buildRuntime(session: SessionStore | null, opts: RuntimeOpts = {}
     });
   }
 
-  const provider = createOpenAIProvider({ baseUrl: config.baseUrl, apiKey: config.apiKey });
+  const primary = resolveModel(config, config.model);
+  const provider = createOpenAIProvider({ baseUrl: primary.baseUrl, apiKey: primary.apiKey });
+
+  // 压缩摘要单独走一条线路：折叠上下文是纯体力活，用主模型的额度去做不划算。
+  // 没配就沿用主模型，绝不因为「没配便宜线路」而放弃压缩。
+  const compactSource = config.compactModel ? resolveModel(config, config.compactModel) : null;
+  const summarize = compactSource
+    ? makeSummarizer(
+        createOpenAIProvider({ baseUrl: compactSource.baseUrl, apiKey: compactSource.apiKey }),
+        compactSource.model,
+      )
+    : undefined;
 
   const loop = new AgentLoop({
     provider,
-    model: config.model,
+    model: primary.model,
     tools,
     workspace: ws,
     exec: sandbox.exec,
@@ -126,7 +151,11 @@ async function buildRuntime(session: SessionStore | null, opts: RuntimeOpts = {}
       budget: config.contextBudget,
       keepRecentTurns: config.keepRecentTurns,
       ...(config.keepTokens > 0 ? { keepTokens: config.keepTokens } : {}),
+      ...(summarize ? { summarize } : {}),
     },
+    confirmMode: config.confirm,
+    assumeYes: config.assumeYes,
+    retry: config.retries > 1 ? { ...DEFAULT_RETRY, attempts: config.retries } : NO_RETRY,
     onRecord: session
       ? (rec) => {
           if (rec.kind === "message") session.appendMessage(rec.message);
@@ -144,6 +173,9 @@ async function buildRuntime(session: SessionStore | null, opts: RuntimeOpts = {}
     memory,
     knowledge: knowledgeConfigured({ url: config.knowledgeUrl }),
     mcpNotes,
+    allowNotes: allow.problems,
+    perms: { level: config.perms, tools: tools.length },
+    modelLabel: primary.alias ? `${primary.alias} → ${primary.model}` : primary.model,
     dispose: async () => {
       for (const c of clients) await c.close();
       await sandbox.dispose();
@@ -179,7 +211,13 @@ async function doctor(opts: RuntimeOpts = {}): Promise<number> {
   console.log("─".repeat(52));
   console.log("运行环境   ", describePlatform());
   console.log("工作区     ", config.workspace);
-  console.log("模型       ", `${config.model} @ ${config.baseUrl}`);
+  const resolved = resolveModel(config, config.model);
+  console.log(
+    "模型       ",
+    resolved.alias
+      ? `${resolved.alias} → ${resolved.model} @ ${resolved.baseUrl}`
+      : `${resolved.model} @ ${resolved.baseUrl}`,
+  );
   console.log("API Key    ", maskKey(config.apiKey));
   console.log("配置文件   ", CONFIG_FILE);
 
@@ -239,6 +277,36 @@ async function doctor(opts: RuntimeOpts = {}): Promise<number> {
       `（单轮长工具链按 ${config.keepTokens || Math.floor(config.contextBudget / 2)} tokens 保留尾部）`,
   );
   console.log("会话保存   ", config.saveSession ? "开启" : "关闭");
+  console.log(
+    "确认策略   ",
+    config.confirm === "off"
+      ? "off（外部工具仍然逐次确认——它们不在策略层内，这一条关不掉）"
+      : `${config.confirm}（${config.confirm === "write" ? "写文件问人" : config.confirm === "exec" ? "写文件与执行都问人" : "全部副作用都问人"}）` +
+          (config.assumeYes ? "；--yes 生效，无确认通道时放行" : "；无确认通道时一律拒绝"),
+  );
+  console.log(
+    "权限档     ",
+    `${config.perms}（${config.perms === "read" ? "只读：不注册 write_file / edit_file / bash" : config.perms === "write" ? "可写：不注册 bash" : "读写执行" }）`,
+  );
+
+  const allow = parseAllowlist(config.cmdAllow);
+  if (!allow.rules.length) {
+    console.log("命令白名单 ", "未启用（只走黑名单；--cmd-allow \"git status,git diff\" 可收紧）");
+  } else {
+    console.log("命令白名单 ", `${allow.rules.length} 条：${allow.rules.map((r) => r.raw).join("、")}`);
+  }
+  for (const problem of allow.problems) console.log("  ", `\x1b[33m${problem}\x1b[0m`);
+
+  console.log(
+    "重试       ",
+    config.retries > 1
+      ? `最多 ${config.retries} 次尝试（指数退避；已经吐过内容或执行过工具就不再重试）`
+      : "关闭",
+  );
+  if (config.compactModel) {
+    const cheap = resolveModel(config, config.compactModel);
+    console.log("压缩模型   ", cheap.alias ? `${cheap.alias} → ${cheap.model}` : cheap.model);
+  }
 
   // 项目约定：只报结论，不打印正文——AGENTS.md 可能几十 KB
   const mem = loadProjectMemory(config.workspace);
@@ -394,11 +462,17 @@ async function interactive(
   } else {
     console.log(`飞码 CodingAgent v${VERSION}`);
     console.log(`工作区 ${cfg.workspace}`);
-    console.log(`模型   ${cfg.model}  沙盒 ${rt.sandboxInfo}`);
+    console.log(`模型   ${rt.modelLabel}  沙盒 ${rt.sandboxInfo}`);
     console.log(`上下文 ${cfg.contextBudget} tokens 自动折叠，保留最近 ${cfg.keepRecentTurns} 轮`);
     if (session) console.log(`会话   ${session.id}（已开启持久化）`);
   }
   console.log(`项目约定 ${rt.memory ? `已载入 ${(rt.memory.bytes / 1024).toFixed(1)} KB（AGENTS.md）` : "未找到 AGENTS.md"}`);
+  console.log(
+    `权限   ${rt.perms.level}（${rt.perms.tools} 个工具）  ` +
+      `确认 ${cfg.confirm === "off" ? "off" : cfg.confirm}` +
+      (cfg.retries > 1 ? `  重试 ${cfg.retries} 次` : ""),
+  );
+  for (const problem of rt.allowNotes) console.log(`\x1b[33m[白名单] ${problem}\x1b[0m`);
   console.log(`知识库 ${rt.knowledge ? cfg.knowledgeUrl + "（search_knowledge 已启用）" : "未配置（跳过 search_knowledge）"}`);
   if (cfg.mcp) {
     console.log(`MCP    ${rt.mcpNotes.length ? rt.mcpNotes.join("；") : "已启用，但没有可用工具"}`);
@@ -647,6 +721,12 @@ function usage(): void {
   --mcp                       启用 MCP 外部工具（默认关闭；配置写在 ~/.feima/mcp.json）
   --mcp-config <file>         指定 MCP 配置文件
   --mcp-allow <a,b>           非交互模式下放行的 MCP 工具（交互模式逐次确认，不需要）
+  --confirm <mode>            哪些副作用要人工确认：off|write|exec|external|all
+  --yes                       要求确认但没有交互通道时放行（run / rpc 用；默认拒绝）
+  --perms <level>             权限档：read 只读，write 加写文件，exec 加命令（默认 exec）
+  --cmd-allow <a,b>           命令白名单，只放行写过的命令前缀（可多次，累加）
+  --compact-model <name>      折叠上下文用哪个模型（别名或模型名），默认沿用主模型
+  --retries <n>               请求最多尝试几次（0～6，默认 3；只会重试未产出任何内容的请求）
 
 沙盒：
   feima sandbox grant [dir]   给 Windows AppContainer 授权工作区的上级目录（通常需管理员）
@@ -658,6 +738,7 @@ function usage(): void {
   FEIMA_KEEP_TOKENS（单轮长工具链保留的尾部 token，默认取预算一半）/ FEIMA_NO_SAVE
   FEIMA_KB_URL / FEIMA_KB_TOKEN / FEIMA_KB_USER / FEIMA_KB_PASSWORD / FEIMA_KB_TOPK
   FEIMA_MCP=1（启用外部工具）/ FEIMA_MCP_CONFIG / FEIMA_MCP_ALLOW（逗号分隔）
+  FEIMA_CONFIRM / FEIMA_YES=1 / FEIMA_PERMS / FEIMA_CMD_ALLOW / FEIMA_COMPACT_MODEL / FEIMA_RETRIES
   FEIMA_HOME（覆盖 ~/.feima）
 `);
 }
@@ -710,6 +791,13 @@ async function main(argv: string[]): Promise<number> {
     ...(flags.mcp ? { mcp: true } : {}),
     ...(flags.mcpConfigFile ? { mcpConfigFile: flags.mcpConfigFile } : {}),
     ...(flags.mcpAllow ? { mcpAllow: flags.mcpAllow } : {}),
+    ...(flags.confirm ? { confirm: flags.confirm } : {}),
+    ...(flags.yes ? { assumeYes: true } : {}),
+    ...(flags.perms ? { perms: flags.perms } : {}),
+    ...(flags.cmdAllow ? { cmdAllow: flags.cmdAllow } : {}),
+    ...(flags.compactModel ? { compactModel: flags.compactModel } : {}),
+    // --retries 0 是「不许重试」，而 0 在配置里是非法的（至少要试一次）
+    ...(flags.retries !== undefined ? { retries: Math.max(1, flags.retries) } : {}),
   };
 
   if (cmd === "--help" || cmd === "-h" || cmd === "help") {

@@ -66,6 +66,10 @@ export function wrapMcpTool(client: McpClient, server: string, info: McpToolInfo
   const name = mcpToolName(server, info.name);
   return {
     name,
+    // external 是「无论确认模式怎么设都必须问」的那一档；
+    // selfConfirmed 表示文案由这里给——只有它知道要说明「跑在策略层之外」
+    effects: ["external"],
+    selfConfirmed: true,
     description: `[MCP ${server}] ${info.description || info.name}（外部工具，每次调用都需要确认）`,
     parameters: info.inputSchema,
     async run(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {

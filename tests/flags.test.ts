@@ -55,3 +55,41 @@ test("新参数缺值时同样报错，不静默变成 undefined", () => {
     assert.throws(() => parseFlags([flag]), /需要一个值/, `${flag} 缺值应当报错`);
   }
 });
+
+test("v0.5 的参数：确认、权限、白名单、压缩模型、重试", () => {
+  const f = parseFlags([
+    "--confirm", "exec",
+    "--yes",
+    "--perms", "read",
+    "--cmd-allow", "git status,git diff",
+    "--cmd-allow", "npm test",
+    "--compact-model", "便宜",
+    "--retries", "5",
+    "干活",
+  ]);
+  assert.equal(f.confirm, "exec");
+  assert.equal(f.yes, true);
+  assert.equal(f.perms, "read");
+  assert.deepEqual(f.cmdAllow, ["git status", "git diff", "npm test"], "多次出现应当累加");
+  assert.equal(f.compactModel, "便宜");
+  assert.equal(f.retries, 5);
+  assert.deepEqual(f.rest, ["干活"]);
+});
+
+test("非法的确认模式与权限档直接报错", () => {
+  assert.throws(() => parseFlags(["--confirm", "always"]), /off|write|exec/);
+  assert.throws(() => parseFlags(["--perms", "root"]), /read|write|exec/);
+});
+
+test("重试次数只接受 0～6，小数与负数都拒", () => {
+  assert.equal(parseFlags(["--retries", "0"]).retries, 0);
+  assert.throws(() => parseFlags(["--retries", "7"]), /0～6/);
+  assert.throws(() => parseFlags(["--retries", "1.5"]), /整数|0～6/);
+  assert.throws(() => parseFlags(["--retries", "-1"]), /0～6/);
+});
+
+test("新参数缺值也要报错", () => {
+  for (const flag of ["--confirm", "--perms", "--cmd-allow", "--compact-model", "--retries"]) {
+    assert.throws(() => parseFlags([flag]), /需要一个值/, `${flag} 缺值应当报错`);
+  }
+});

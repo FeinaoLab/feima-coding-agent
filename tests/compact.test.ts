@@ -9,7 +9,7 @@ import {
 } from "../src/core/compact.ts";
 import type { ChatMessage } from "../src/types.ts";
 
-function m(role: ChatMessage["role"], content: string, extra: Partial<ChatMessage> = {}): ChatMessage {
+function m(role: ChatMessage["role"], content: string | null, extra: Partial<ChatMessage> = {}): ChatMessage {
   return { role, content, ...extra };
 }
 
