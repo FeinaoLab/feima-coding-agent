@@ -1,0 +1,10 @@
+node_modules/
+.feima/
+dist/
+coverage/
+*.log
+.DS_Store
+# 本机配置与密钥永远不进仓库
+.env
+.env.*
+!.env.example

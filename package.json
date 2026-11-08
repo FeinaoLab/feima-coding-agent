@@ -1,0 +1,32 @@
+{
+  "name": "feima-coding-agent",
+  "version": "0.1.0",
+  "description": "飞码 CodingAgent — 中文优先的终端编程 Agent，零运行时依赖",
+  "type": "module",
+  "bin": {
+    "feima": "./bin/feima.mjs"
+  },
+  "engines": {
+    "node": ">=22.6"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.ts",
+    "doctor": "node src/cli.ts doctor",
+    "dev": "node src/cli.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "files": [
+    "bin",
+    "src",
+    "docs"
+  ],
+  "keywords": [
+    "coding-agent",
+    "cli",
+    "llm",
+    "agent"
+  ],
+  "license": "MIT",
+  "dependencies": {},
+  "devDependencies": {}
+}
