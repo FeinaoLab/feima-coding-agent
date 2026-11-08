@@ -12,16 +12,20 @@
  *   feima doctor               体检：配置、策略、沙盒握手、上下文与存储
  */
 
+import fs from "node:fs";
 import readline from "node:readline";
 import process from "node:process";
 import path from "node:path";
 import { loadConfig, writeExampleConfig, CONFIG_FILE, type FeimaConfig } from "./config.ts";
-import { buildSystemPrompt } from "./prompt.ts";
+import { buildSystemPrompt, loadProjectMemory, type ProjectMemory } from "./prompt.ts";
 import { AgentLoop } from "./core/loop.ts";
 import { SessionStore, defaultSessionDir } from "./core/session.ts";
 import { estimateMessages } from "./core/compact.ts";
 import { createOpenAIProvider } from "./providers/openai.ts";
 import { builtinTools } from "./tools/builtin.ts";
+import { createKnowledgeTool, knowledgeConfigured } from "./tools/knowledge.ts";
+import { parseMcpConfig, type McpClient } from "./mcp/client.ts";
+import { loadMcpTools } from "./mcp/tools.ts";
 import { assertWorkspace, defaultPolicy, redact } from "./safety/policy.ts";
 import { createSandbox, handshake, describePlatform, probeIsolation } from "./safety/exec.ts";
 import { grantAncestors } from "./safety/backends/appcontainer.ts";
@@ -29,13 +33,21 @@ import { startRpcHost } from "./rpc/host.ts";
 import { parseFlags } from "./cli/flags.ts";
 import type { AgentEvent, ChatMessage } from "./types.ts";
 
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 
 interface Runtime {
   config: ReturnType<typeof loadConfig>;
   loop: AgentLoop;
   sandboxInfo: string;
   session: SessionStore | null;
+  /** 工作区 AGENTS.md 的载入结果；null 表示没有 */
+  memory: ProjectMemory | null;
+  /** 知识库检索是否启用 */
+  knowledge: boolean;
+  /** MCP 装载过程中的说明与失败原因，启动横幅与 doctor 共用 */
+  mcpNotes: string[];
+  /** 收尾：关掉 MCP 子进程 */
+  dispose: () => Promise<void>;
 }
 
 // 运行时覆盖沿用整套配置类型：新增开关（沙盒、隔离后端、网络）不必再改签名
@@ -60,7 +72,44 @@ async function buildRuntime(session: SessionStore | null, opts: RuntimeOpts = {}
   // 退出时撤销 AppContainer 的目录授权：留着 ACL 就是安全债
   process.once("exit", () => void sandbox.dispose());
 
+  const memory = loadProjectMemory(ws);
   const tools = builtinTools({ policy });
+
+  if (knowledgeConfigured({ url: config.knowledgeUrl })) {
+    tools.push(
+      createKnowledgeTool({
+        url: config.knowledgeUrl,
+        token: config.knowledgeToken,
+        username: config.knowledgeUser,
+        password: config.knowledgePassword,
+        topK: config.knowledgeTopK,
+      }),
+    );
+  }
+
+  const mcpNotes: string[] = [];
+  const clients: McpClient[] = [];
+  if (config.mcp) {
+    let servers: Parameters<typeof loadMcpTools>[0]["config"] = { servers: {} };
+    try {
+      const raw = JSON.parse(fs.readFileSync(config.mcpConfigFile, "utf8"));
+      const parsed = parseMcpConfig(raw);
+      servers = parsed.config;
+      mcpNotes.push(...parsed.problems);
+    } catch (err) {
+      mcpNotes.push(`读取 ${config.mcpConfigFile} 失败：${err instanceof Error ? err.message : String(err)}`);
+    }
+    if (Object.keys(servers.servers).length) {
+      const loaded = await loadMcpTools({ config: servers, allow: config.mcpAllow });
+      tools.push(...loaded.tools);
+      clients.push(...loaded.clients);
+      mcpNotes.push(...loaded.notes);
+    }
+    process.once("exit", () => {
+      for (const c of clients) void c.close();
+    });
+  }
+
   const provider = createOpenAIProvider({ baseUrl: config.baseUrl, apiKey: config.apiKey });
 
   const loop = new AgentLoop({
@@ -69,7 +118,7 @@ async function buildRuntime(session: SessionStore | null, opts: RuntimeOpts = {}
     tools,
     workspace: ws,
     exec: sandbox.exec,
-    systemPrompt: buildSystemPrompt(ws, config.systemExtra),
+    systemPrompt: buildSystemPrompt(ws, config.systemExtra, memory),
     maxTurns: config.maxTurns,
     maxTokens: config.maxTokens,
     temperature: config.temperature,
@@ -87,12 +136,31 @@ async function buildRuntime(session: SessionStore | null, opts: RuntimeOpts = {}
       : undefined,
   });
 
-  return { config, loop, sandboxInfo: sandbox.describe(), session };
+  return {
+    config,
+    loop,
+    sandboxInfo: sandbox.describe(),
+    session,
+    memory,
+    knowledge: knowledgeConfigured({ url: config.knowledgeUrl }),
+    mcpNotes,
+    dispose: async () => {
+      for (const c of clients) await c.close();
+      await sandbox.dispose();
+    },
+  };
 }
 
 function maskKey(key: string): string {
   if (!key) return "（未配置）";
   return key.length <= 8 ? "••••" : `••••${key.slice(-4)}`;
+}
+
+/** readline 的问题-回答包成 Promise；确认闸门要用 */
+function askLine(rl: readline.Interface, question: string): Promise<string> {
+  return new Promise((resolve) => {
+    rl.question(question, resolve);
+  });
 }
 
 function newSession(config: ReturnType<typeof loadConfig>): SessionStore | null {
@@ -105,8 +173,8 @@ function newSession(config: ReturnType<typeof loadConfig>): SessionStore | null 
   }
 }
 
-async function doctor(): Promise<number> {
-  const config = loadConfig();
+async function doctor(opts: RuntimeOpts = {}): Promise<number> {
+  const config = loadConfig(opts);
   console.log("飞码 CodingAgent · 体检");
   console.log("─".repeat(52));
   console.log("运行环境   ", describePlatform());
@@ -171,6 +239,64 @@ async function doctor(): Promise<number> {
       `（单轮长工具链按 ${config.keepTokens || Math.floor(config.contextBudget / 2)} tokens 保留尾部）`,
   );
   console.log("会话保存   ", config.saveSession ? "开启" : "关闭");
+
+  // 项目约定：只报结论，不打印正文——AGENTS.md 可能几十 KB
+  const mem = loadProjectMemory(config.workspace);
+  console.log(
+    "项目约定   ",
+    mem
+      ? `${path.relative(config.workspace, mem.path) || "AGENTS.md"} 已载入 ${(mem.bytes / 1024).toFixed(1)} KB${mem.truncated ? "（超长已截断到 32 KB）" : ""}`
+      : "未找到 AGENTS.md（可选，放在工作区根目录即可自动载入）",
+  );
+
+  // 知识库：配置了就真跑一次检索。检测到有 URL 和真能检索是两件事
+  if (!knowledgeConfigured({ url: config.knowledgeUrl })) {
+    console.log("知识库     ", "未配置（设置 FEIMA_KB_URL 后启用 search_knowledge）");
+  } else {
+    const hasAuth = Boolean(config.knowledgeToken || (config.knowledgeUser && config.knowledgePassword));
+    const tool = createKnowledgeTool({
+      url: config.knowledgeUrl,
+      token: config.knowledgeToken,
+      username: config.knowledgeUser,
+      password: config.knowledgePassword,
+      topK: 1,
+      timeoutMs: 5000,
+    });
+    const probe = await tool.run({ query: "飞码", limit: 1 }, {
+      workspace: config.workspace,
+      exec: async () => ({ exitCode: 0, stdout: "", stderr: "", timedOut: false }),
+    });
+    console.log("知识库     ", config.knowledgeUrl + (hasAuth ? "（已配置凭据）" : "（缺凭据）"));
+    console.log("  检索探针 ", probe.ok ? probe.content.split("\n")[0] : `失败：${probe.content.split("\n")[0]}`);
+    if (!probe.ok) ok = false;
+  }
+
+  // MCP：默认关闭；开启了就真起一次子进程，而不是只读配置文件
+  if (!config.mcp) {
+    console.log("MCP        ", `未启用（外部工具默认关闭，--mcp 打开；配置写在 ${config.mcpConfigFile}）`);
+  } else {
+    let notes: string[] = [];
+    let toolCount = 0;
+    let clients: McpClient[] = [];
+    try {
+      const parsed = parseMcpConfig(JSON.parse(fs.readFileSync(config.mcpConfigFile, "utf8")));
+      notes = parsed.problems.slice();
+      const loaded = await loadMcpTools({ config: parsed.config, allow: config.mcpAllow });
+      toolCount = loaded.tools.length;
+      clients = loaded.clients;
+      notes.push(...loaded.notes);
+    } catch (err) {
+      notes.push(`读取 ${config.mcpConfigFile} 失败：${err instanceof Error ? err.message : String(err)}`);
+    }
+    try {
+      console.log("MCP        ", `${config.mcpConfigFile} → ${toolCount} 个工具`);
+      for (const note of notes) console.log("  ", note);
+      if (config.mcpAllow.length) console.log("  放行列表 ", config.mcpAllow.join(", "));
+      else console.log("  放行列表 ", "空（非交互模式下一律拒绝，交互模式逐次确认）");
+    } finally {
+      for (const c of clients) await c.close();
+    }
+  }
 
   if (!config.apiKey || config.apiKey.includes("在这里填")) {
     console.log("提示       ", `还没有配置 API Key，可编辑 ${CONFIG_FILE}`);
@@ -272,11 +398,26 @@ async function interactive(
     console.log(`上下文 ${cfg.contextBudget} tokens 自动折叠，保留最近 ${cfg.keepRecentTurns} 轮`);
     if (session) console.log(`会话   ${session.id}（已开启持久化）`);
   }
+  console.log(`项目约定 ${rt.memory ? `已载入 ${(rt.memory.bytes / 1024).toFixed(1)} KB（AGENTS.md）` : "未找到 AGENTS.md"}`);
+  console.log(`知识库 ${rt.knowledge ? cfg.knowledgeUrl + "（search_knowledge 已启用）" : "未配置（跳过 search_knowledge）"}`);
+  if (cfg.mcp) {
+    console.log(`MCP    ${rt.mcpNotes.length ? rt.mcpNotes.join("；") : "已启用，但没有可用工具"}`);
+  } else {
+    console.log("MCP    未启用（外部工具默认关闭，--mcp 打开）");
+  }
   console.log(`输入 /help 查看命令，Ctrl+C 中止当前任务，Ctrl+D 退出\n`);
 
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout, prompt: "\x1b[36m›\x1b[0m " });
 
   let streaming = false;
+
+  // 外部工具逐次确认：MCP 不在飞码的策略层里，每一次调用都得让人看见参数
+  rt.loop.setConfirm(async (req) => {
+    if (streaming) process.stdout.write("\x1b[90m（任务进行中，需要你确认一个外部动作）\x1b[0m\n");
+    const answer = await askLine(rl, `\x1b[33m[确认] ${req.title}\x1b[0m\n${req.detail}\n允许执行？(y/N) `);
+    return /^y(es)?$/i.test(answer.trim());
+  });
+
   const print = consoleEvents(true);
   rt.loop.setEventHandler((e) => {
     if (e.type === "status") streaming = e.state === "chatting";
@@ -501,6 +642,11 @@ function usage(): void {
   --docker-image <name>       docker 后端使用的镜像（默认 node:22-alpine）
   --no-save                   不写会话文件
   --json                      事件流输出
+  --knowledge <url>           启用飞链 RAG 检索（知识库地址，例如 http://42.193.158.63）
+  --kb-token <token>          知识库 token（也可用账号密码换，见环境变量）
+  --mcp                       启用 MCP 外部工具（默认关闭；配置写在 ~/.feima/mcp.json）
+  --mcp-config <file>         指定 MCP 配置文件
+  --mcp-allow <a,b>           非交互模式下放行的 MCP 工具（交互模式逐次确认，不需要）
 
 沙盒：
   feima sandbox grant [dir]   给 Windows AppContainer 授权工作区的上级目录（通常需管理员）
@@ -510,6 +656,8 @@ function usage(): void {
   FEIMA_ISOLATION（默认 auto）/ FEIMA_NETWORK=1（允许出网）/ FEIMA_DOCKER_IMAGE
   FEIMA_CONTEXT_BUDGET（默认 22000）/ FEIMA_KEEP_TURNS（默认 3）
   FEIMA_KEEP_TOKENS（单轮长工具链保留的尾部 token，默认取预算一半）/ FEIMA_NO_SAVE
+  FEIMA_KB_URL / FEIMA_KB_TOKEN / FEIMA_KB_USER / FEIMA_KB_PASSWORD / FEIMA_KB_TOPK
+  FEIMA_MCP=1（启用外部工具）/ FEIMA_MCP_CONFIG / FEIMA_MCP_ALLOW（逗号分隔）
   FEIMA_HOME（覆盖 ~/.feima）
 `);
 }
@@ -557,6 +705,11 @@ async function main(argv: string[]): Promise<number> {
     ...(flags.isolation ? { isolation: flags.isolation } : {}),
     ...(flags.network ? { network: true } : {}),
     ...(flags.dockerImage ? { dockerImage: flags.dockerImage } : {}),
+    ...(flags.knowledgeUrl ? { knowledgeUrl: flags.knowledgeUrl } : {}),
+    ...(flags.knowledgeToken ? { knowledgeToken: flags.knowledgeToken } : {}),
+    ...(flags.mcp ? { mcp: true } : {}),
+    ...(flags.mcpConfigFile ? { mcpConfigFile: flags.mcpConfigFile } : {}),
+    ...(flags.mcpAllow ? { mcpAllow: flags.mcpAllow } : {}),
   };
 
   if (cmd === "--help" || cmd === "-h" || cmd === "help") {
@@ -572,7 +725,9 @@ async function main(argv: string[]): Promise<number> {
     console.log(`已准备配置模板：${file}`);
     return 0;
   }
-  if (cmd === "doctor") return doctor();
+  // doctor 也吃命令行覆盖：否则 `feima doctor --mcp --mcp-config x` 会被静默忽略，
+  // 用户看到「MCP 未启用」而以为自己参数写错了（v0.2.1 那类「解析出来没人用」）
+  if (cmd === "doctor") return doctor(cfgOverride);
   if (cmd === "rpc") return startRpcHost(cfgOverride);
   if (cmd === "sessions") return sessionsCommand(flags.rest, flags.json);
   if (cmd === "sandbox") return sandboxCommand(flags.rest, cfgOverride);

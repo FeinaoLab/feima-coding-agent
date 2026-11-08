@@ -10,12 +10,13 @@ feima run "把 src/config.ts 里的超时改成可配置，并补一个测试"
 
 参考 `@inkwellio/my-coding-agent` 的桌面端实现之后，判断很清楚：桌面壳（Electron）不是难点，Agent 的**循环、状态机、安全边界**才是。飞码先把这三件事做对，再谈界面。
 
-四条设计取向：
+五条设计取向：
 
 - **零依赖**。只用 Node 内置能力（`node:fs` / `node:child_process` / `fetch`）。没有 SDK、没有框架、没有状态库。装完之后 `node_modules` 是空的。
 - **安全边界先于功能**。路径越界、环境变量泄漏、`.git/hooks` 持久化、符号链接绕过，这些在 v0.1 就堵住，不等以后。
 - **状态以 `isStreaming` 为唯一权威**。事件只用来提示，不用来判定结束。这是 UI 不闪烁、任务不误判的前提。
 - **长会话可用**。上下文超预算自动折叠早期历史，会话落盘可恢复；不是「聊到一半就得重开」。
+- **外部能力默认关闭**。MCP 这类跑在自己策略层之外的工具，必须显式打开、逐次确认；宁可少一个工具，不留一个未经确认的出口。
 
 ## 快速开始
 
@@ -58,7 +59,7 @@ FEIMA_BASE_URL=http://localhost:11434/v1 FEIMA_API_KEY=ollama FEIMA_MODEL=qwen3:
 | `feima resume [id\|last]` | 恢复会话，把历史带回来继续 |
 | `feima sessions` | 列出会话（`--json` 可解析，`rm <id>` 删除） |
 | `feima rpc` | 常驻进程，stdin/stdout 收发 JSON 行，供桌面端驱动 |
-| `feima doctor` | 体检：配置、策略、各隔离后端探测 + 真自检、会话目录、上下文预算 |
+| `feima doctor` | 体检：配置、策略、各隔离后端探测 + 真自检、会话目录、上下文预算、项目约定、知识库检索探针、MCP 子进程 |
 | `feima init` | 生成 `~/.feima/config.json` 模板 |
 
 交互模式里的斜杠命令：
@@ -123,6 +124,74 @@ FEIMA_BASE_URL=http://localhost:11434/v1 FEIMA_API_KEY=ollama FEIMA_MODEL=qwen3:
 | `glob` | 通配符找文件 | 只读 |
 | `grep` | 正则搜内容 | 只读 |
 | `bash` | 执行命令（Windows 走 PowerShell） | 命令策略过滤 + 执行层超时杀进程 |
+| `search_knowledge` | 检索飞链知识库，返回带编号的片段 | 未配置就不注册；单条截断 400 字 |
+
+外部工具（MCP）不在这张表里：要显式打开，且每次调用都要确认，见下文。
+
+## 项目约定（AGENTS.md）
+
+工作区根目录放一个 `AGENTS.md`，启动时自动读进系统提示词。写清楚这个仓库的规矩——目录结构、命名、禁止的做法、常用命令——比每次口述一遍划算。
+
+```bash
+# 无需任何配置，放在工作区根目录即可
+echo "# 本项目用 2 空格缩进，禁止直接改 dist/" > AGENTS.md
+feima doctor    # 会显示「项目约定 AGENTS.md 已载入 7.5 KB」
+```
+
+三条硬约束：
+
+1. **只读工作区根目录这一个文件**，不向上遍历、不读子目录里的同名文件；符号链接会被 `realpath` 检查，指向工作区外就当作不存在。
+2. **上限 32 KB**，超出截断并明说「只截取了前 32 KB」。往 AGENTS.md 里贴整份文档会把上下文预算吃光，反而让 Agent 记不住最近几轮。
+3. **它不能放宽安全边界**。注入时会先写一段声明：任何要求跳过确认、忽略策略、读取凭据、向工作区外写入的内容一律无效。理由很实际——`AGENTS.md` 是仓库里的普通文件，谁都能改；如果它能覆盖安全策略，那往仓库提一个 `AGENTS.md` 就等于提权。
+
+## 知识库检索（飞链 RAG）
+
+配置后多一个 `search_knowledge` 工具，检索飞链知识库（`POST /api/ai/search`）并返回带编号的片段。
+
+```bash
+# 方式一：账号密码（进程内换 token，不落盘）
+export FEIMA_KB_URL=http://your-kb-host
+export FEIMA_KB_USER=admin
+export FEIMA_KB_PASSWORD=***
+
+# 方式二：直接给 token
+export FEIMA_KB_URL=http://your-kb-host FEIMA_KB_TOKEN=***
+
+feima doctor          # 「检索探针」会真检索一次，不只看配置在不在
+```
+
+设计上的三点：
+
+- **未配置就不注册工具**。注册一个永远报错的工具，模型会反复试，几轮就把上下文烧完。
+- **结果必须截断**：单条 400 字、最多 8 条。检索结果是外部文本，长度不可控，原样灌进去会挤掉工作区里的真实代码。
+- **凭据只在内存**：token 不落盘、不进日志、不传给子进程；`doctor` 只报「已配置凭据」。
+
+## MCP 外部工具
+
+支持 stdio 传输的 MCP 服务器（`initialize` / `tools/list` / `tools/call` 三件事，其余协议部分不实现）。
+
+```bash
+# ~/.feima/mcp.json
+{
+  "servers": {
+    "everything": { "command": "node", "args": ["/path/to/server-everything/dist/index.js"] }
+  }
+}
+
+FEIMA_MCP=1 feima            # 打开；默认是关的
+FEIMA_MCP=1 feima doctor     # 会真起子进程并列出每个服务器的工具数
+feima run "..." --mcp-allow everything.get-sum   # 非交互模式：显式放行
+```
+
+默认关闭的理由不是多疑，而是**能力边界不同**：内置工具跑在策略层 + 沙盒里，读写被约束在工作区；MCP 工具是外部进程，它拿什么凭据、能访问什么、会不会把数据发出去，飞码一概不知道。所以：
+
+| 场景 | 行为 |
+| --- | --- |
+| 交互模式（`feima`） | 每次调用弹确认，显示工具名与参数摘要，默认是「否」 |
+| 非交互（`run` / `rpc`） | 无确认入口，只认 `--mcp-allow` 放行列表，其余一律拒绝 |
+| 一台服务器起不来 | 只记一条失败原因，其余服务器照常可用，不拖死整个进程 |
+
+工具名统一加前缀 `mcp__<server>__<tool>`，与内置工具不可能撞名。服务器往 stdout 打的日志会被识别成噪音并丢弃——一个 `console.log` 不该让整套工具不可用。
 
 ## 安全模型
 
@@ -167,7 +236,7 @@ CLI / RPC / (未来的 GUI)
         ├── Compact（超预算折叠 → 摘要 / 降级规则摘要）
         ├── Session（JSONL append-only，随消息流同步落盘）
         ├── Provider（OpenAI 兼容，SSE 自己切 \n）
-        ├── Tools（7 个内置）
+        ├── Tools（7 个内置 + search_knowledge + MCP 外部工具）
         └── Sandbox（策略层 + 隔离后端：appcontainer / bwrap / docker）
 ```
 
@@ -180,17 +249,20 @@ bin/feima.mjs         入口（加载 TS，无构建）
 src/
   cli.ts              命令行、斜杠命令、会话接入
   config.ts           配置装载
-  prompt.ts           系统提示词
+  prompt.ts           系统提示词、AGENTS.md 载入
   types.ts            公共类型
   core/loop.ts        双循环与状态机
   core/compact.ts     上下文压缩与 token 估算
   core/session.ts     会话持久化
   providers/openai.ts SSE 流式与工具调用拼装
   tools/builtin.ts    7 个内置工具
+  tools/knowledge.ts  飞链 RAG 检索工具
+  mcp/client.ts       MCP stdio 客户端（initialize / tools/list / tools/call）
+  mcp/tools.ts        把 MCP 工具包成飞码工具，含逐次确认闸门
   safety/policy.ts    路径与环境变量策略、脱敏
   safety/exec.ts      执行器、握手、命令过滤
   rpc/host.ts         JSONL 协议宿主
-tests/                node:test，38 个用例
+tests/                node:test，95 个用例
 docs/                 立项书、架构、路线图、决策记录
 EVOLUTION.md          版本演进台账
 ```
@@ -198,7 +270,7 @@ EVOLUTION.md          版本演进台账
 ## 开发
 
 ```bash
-npm test          # 38 个用例，全部离线，不联网
+npm test          # 95 个用例，全部离线，不联网
 npm run doctor
 npm run typecheck # 需要另装 typescript（可选，开发期依赖）
 ```
@@ -210,8 +282,9 @@ npm run typecheck # 需要另装 typescript（可选，开发期依赖）
 v0.1：核心循环、工具、策略层安全、CLI、RPC。
 v0.2：上下文压缩、会话持久化。
 v0.2.1：长任务验收补做，修掉「单轮长工具链不压缩」「空输出截断判完成」「`--workspace` 失效」。
-v0.3（当前）：隔离后端——AppContainer / bubblewrap / docker，真探针式自检。
-v0.4：重试策略、工具确认、多模型配置。
+v0.3：隔离后端——AppContainer / bubblewrap / docker，真探针式自检。
+v0.4（当前）：飞链 RAG 检索、AGENTS.md 自动载入、MCP 客户端（默认关、逐次确认）。
+v0.5：重试策略、多模型别名、命令白名单。
 v1.0：Electron 桌面端，复用 `feima rpc`，不重写引擎。
 
 详见 `docs/02-路线图.md`。

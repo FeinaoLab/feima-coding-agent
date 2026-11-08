@@ -1,5 +1,32 @@
 # CHANGELOG
 
+## v0.4.0 — 2026-11-08
+
+从「只在自己的一亩地里干活」到「能读外部知识、能守项目规矩、能接外部工具」。三件事的共同点是都得过安全关：知识库要截断，项目约定不能提权，MCP 默认关闭且逐次确认。
+
+### 新增
+
+- **项目约定自动载入**（`src/prompt.ts`）：工作区根的 `AGENTS.md` 启动时读进系统提示词。只读这一个文件、不向上遍历、符号链接按 `realpath` 判断是否越界、上限 32 KB。注入时先声明「它不能放宽安全边界」——理由是往仓库提一个 `AGENTS.md` 不能等于提权。
+- **飞链 RAG 检索工具**（`src/tools/knowledge.ts`）：`search_knowledge`，调 `POST /api/ai/search`，返回带编号的片段。支持直接给 token 或账号密码换 token（仅进程内存）。单条截断 400 字、最多 8 条。
+- **MCP 客户端**（`src/mcp/client.ts`）：stdio + 换行分隔 JSON-RPC，只实现 `initialize` / `tools/list` / `tools/call`。超时、子进程退出、服务端往 stdout 打日志都有处理。
+- **MCP 工具包装与确认闸门**（`src/mcp/tools.ts`）：工具名带 `mcp__<server>__<tool>` 前缀；交互模式每次调用弹确认（显示参数摘要），非交互模式只认 `--mcp-allow`。
+- CLI 新增 `--knowledge` / `--kb-token` / `--mcp` / `--mcp-config` / `--mcp-allow`，对应 `FEIMA_KB_URL` / `FEIMA_KB_TOKEN` / `FEIMA_KB_USER` / `FEIMA_KB_PASSWORD` / `FEIMA_KB_TOPK` / `FEIMA_MCP` / `FEIMA_MCP_CONFIG` / `FEIMA_MCP_ALLOW`。
+- `doctor` 新增三块：项目约定载入情况、知识库**真检索探针**、MCP 真起子进程并列出每个服务器的工具数。
+
+### 修复
+
+- **Windows 上 `shell: true` 会把带空格的参数拆开**：为了跑 `npx` 而整体走 shell，结果 `node "D:/My Project/server.mjs"` 被 cmd 拆成三段，服务端起不来，报的还是一条难懂的语法错误。改为自己按 `PATH` + `PATHEXT` 查找：绝对路径直接 spawn，`.exe`/`.com` 直接 spawn，只有 `.cmd`/`.bat` 才经 `cmd.exe` 并逐个给参数加引号。
+- **确认闸门接不上就是静默失效**：`loop.ts` 里 `confirm` 没往 `ToolContext` 传时，所有单测都是绿的，表现却是「MCP 配了也调不动」——工具被静默判成「无人确认」而拒绝。补一条用例专门守这一行转接。
+- **超时会被取消信号吃掉**：`signal: ctx.signal ?? AbortSignal.timeout(...)` 这种写法，一旦有 `ctx.signal` 就再也不会超时。改用 `AbortSignal.any` 让两者都生效。
+- **`doctor` 忽略命令行覆盖**：`feima doctor --mcp --mcp-config x` 会被静默忽略，用户看到「MCP 未启用」还以为参数写错了。`doctor` 现在接收同一份覆盖对象。这是「解析出来没人用」这一类 bug 的第三次复发（前两次是 `--sandbox`、`--workspace`），所以这回顺便在 `AGENTS.md` 里把它写成硬规则。
+
+### 测试
+
+95 例（策略 7 / 循环 12 / 执行 4 / 压缩 13 / 会话 9 / 长任务 3 / 参数 8 / 隔离 8 / 约定 6 / 知识库 11 / MCP 14），全部离线。
+
+真机验证：知识库检索（`http://42.193.158.63`）返回真实片段；`@modelcontextprotocol/server-everything` 起得来、列出 13 个工具、`callTool` 四场景（放行 / 未放行 / 用户拒绝 / 用户同意）行为正确；本仓库 `AGENTS.md`（7.5 KB）注入系统提示词。
+
+
 ## v0.3.0 — 2026-11-08
 
 `strict` 从"空壳"变成"真的能隔离"。三平台各给一个后端，可用性靠探针判定而不是靠"装没装"。

@@ -33,12 +33,27 @@ export interface FeimaConfig {
   keepTokens: number;
   /** 是否把会话写入 ~/.feima/sessions */
   saveSession: boolean;
+  /** 飞链 RAG 知识库地址（例如 http://42.193.158.63），空表示不启用检索工具 */
+  knowledgeUrl: string;
+  /** 知识库 token；不给则用账号密码换 */
+  knowledgeToken: string;
+  knowledgeUser: string;
+  knowledgePassword: string;
+  /** 检索默认条数 */
+  knowledgeTopK: number;
+  /** 是否启用 MCP 外部工具；默认关闭——外部工具不在飞码的沙盒里 */
+  mcp: boolean;
+  /** MCP 配置文件路径，默认 ~/.feima/mcp.json */
+  mcpConfigFile: string;
+  /** 非交互模式下放行的 MCP 工具（交互模式走逐次确认，不需要这个） */
+  mcpAllow: string[];
 }
 
 export const CONFIG_DIR = path.join(os.homedir(), ".feima");
 export const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
+export const MCP_FILE = path.join(CONFIG_DIR, "mcp.json");
 
-type FileConfig = Partial<Record<keyof FeimaConfig, string | number>>;
+type FileConfig = Partial<Record<keyof FeimaConfig, string | number | string[]>>;
 
 function readFileConfig(): FileConfig {
   try {
@@ -61,6 +76,20 @@ function pickNum(fallback: number, ...values: Array<string | number | undefined>
     if (Number.isFinite(n)) return n;
   }
   return fallback;
+}
+
+/** 允许多来源给列表：数组直接用，字符串按逗号切 */
+function pickList(...values: Array<string | string[] | undefined>): string[] {
+  for (const v of values) {
+    if (Array.isArray(v)) return v.map((x) => String(x).trim()).filter(Boolean);
+    if (typeof v === "string" && v.trim()) {
+      return v
+        .split(",")
+        .map((x) => x.trim())
+        .filter(Boolean);
+    }
+  }
+  return [];
 }
 
 export function loadConfig(overrides: Partial<FeimaConfig> = {}): FeimaConfig {
@@ -130,6 +159,36 @@ export function loadConfig(overrides: Partial<FeimaConfig> = {}): FeimaConfig {
     keepRecentTurns: Math.max(1, pickNum(3, overrides.keepRecentTurns, env.FEIMA_KEEP_TURNS, file.keepRecentTurns)),
     keepTokens: Math.max(0, pickNum(0, overrides.keepTokens, env.FEIMA_KEEP_TOKENS, file.keepTokens)),
     saveSession: env.FEIMA_NO_SAVE ? false : (overrides.saveSession ?? file.saveSession ?? true) !== false,
+    knowledgeUrl: pickStr(
+      overrides.knowledgeUrl,
+      env.FEIMA_KB_URL,
+      typeof file.knowledgeUrl === "string" ? file.knowledgeUrl : "",
+    ),
+    knowledgeToken: pickStr(
+      overrides.knowledgeToken,
+      env.FEIMA_KB_TOKEN,
+      typeof file.knowledgeToken === "string" ? file.knowledgeToken : "",
+    ),
+    knowledgeUser: pickStr(
+      overrides.knowledgeUser,
+      env.FEIMA_KB_USER,
+      typeof file.knowledgeUser === "string" ? file.knowledgeUser : "",
+    ),
+    knowledgePassword: pickStr(
+      overrides.knowledgePassword,
+      env.FEIMA_KB_PASSWORD,
+      typeof file.knowledgePassword === "string" ? file.knowledgePassword : "",
+    ),
+    knowledgeTopK: Math.min(8, Math.max(1, pickNum(5, overrides.knowledgeTopK, env.FEIMA_KB_TOPK, file.knowledgeTopK as number))),
+    // 默认关：外部工具能干什么，飞码管不了，所以必须用户显式打开
+    mcp: env.FEIMA_MCP ? env.FEIMA_MCP === "1" || env.FEIMA_MCP === "true" : (overrides.mcp ?? file.mcp ?? false) === true,
+    mcpConfigFile: pickStr(
+      overrides.mcpConfigFile,
+      env.FEIMA_MCP_CONFIG,
+      typeof file.mcpConfigFile === "string" ? file.mcpConfigFile : "",
+      MCP_FILE,
+    ),
+    mcpAllow: pickList(overrides.mcpAllow, env.FEIMA_MCP_ALLOW, file.mcpAllow as string[]),
   };
 }
 
@@ -153,6 +212,14 @@ export function writeExampleConfig(cfg: FeimaConfig): string {
     keepRecentTurns: cfg.keepRecentTurns,
     keepTokens: cfg.keepTokens,
     saveSession: cfg.saveSession,
+    knowledgeUrl: cfg.knowledgeUrl,
+    knowledgeToken: "（填 token，或改用 knowledgeUser / knowledgePassword）",
+    knowledgeUser: cfg.knowledgeUser,
+    knowledgePassword: "（与 knowledgeUser 配套）",
+    knowledgeTopK: cfg.knowledgeTopK,
+    mcp: cfg.mcp,
+    mcpConfigFile: cfg.mcpConfigFile,
+    mcpAllow: cfg.mcpAllow,
   };
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(sample, null, 2), { mode: 0o600 });
   return CONFIG_FILE;

@@ -15,12 +15,16 @@
  *   {"id":"7","method":"shutdown"}
  */
 
+import fs from "node:fs";
 import process from "node:process";
-import { loadConfig } from "../config.ts";
-import { buildSystemPrompt } from "../prompt.ts";
+import { loadConfig, type FeimaConfig } from "../config.ts";
+import { buildSystemPrompt, loadProjectMemory } from "../prompt.ts";
 import { AgentLoop } from "../core/loop.ts";
 import { createOpenAIProvider } from "../providers/openai.ts";
 import { builtinTools } from "../tools/builtin.ts";
+import { createKnowledgeTool, knowledgeConfigured } from "../tools/knowledge.ts";
+import { parseMcpConfig } from "../mcp/client.ts";
+import { loadMcpTools } from "../mcp/tools.ts";
 import { assertWorkspace, defaultPolicy, redact } from "../safety/policy.ts";
 import { createSandbox, handshake } from "../safety/exec.ts";
 
@@ -34,8 +38,8 @@ function writeLine(obj: unknown): void {
   process.stdout.write(JSON.stringify(obj) + "\n");
 }
 
-export async function startRpcHost(opts: { workspace?: string; model?: string } = {}): Promise<number> {
-  const config = loadConfig({ workspace: opts.workspace, model: opts.model });
+export async function startRpcHost(opts: Partial<FeimaConfig> = {}): Promise<number> {
+  const config = loadConfig(opts);
   const workspace = assertWorkspace(config.workspace);
   const policy = defaultPolicy({ workspace });
   const sandbox = createSandbox({
@@ -56,13 +60,43 @@ export async function startRpcHost(opts: { workspace?: string; model?: string } 
     return 1;
   }
 
+  const tools = builtinTools({ policy });
+  if (knowledgeConfigured({ url: config.knowledgeUrl })) {
+    tools.push(
+      createKnowledgeTool({
+        url: config.knowledgeUrl,
+        token: config.knowledgeToken,
+        username: config.knowledgeUser,
+        password: config.knowledgePassword,
+        topK: config.knowledgeTopK,
+      }),
+    );
+  }
+
+  const mcpNotes: string[] = [];
+  const mcpClients: Array<{ close: () => Promise<void> }> = [];
+  if (config.mcp) {
+    try {
+      const parsed = parseMcpConfig(JSON.parse(fs.readFileSync(config.mcpConfigFile, "utf8")));
+      mcpNotes.push(...parsed.problems);
+      const loaded = await loadMcpTools({ config: parsed.config, allow: config.mcpAllow });
+      tools.push(...loaded.tools);
+      mcpClients.push(...loaded.clients);
+      mcpNotes.push(...loaded.notes);
+    } catch (err) {
+      mcpNotes.push(`读取 ${config.mcpConfigFile} 失败：${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   const loop = new AgentLoop({
     provider: createOpenAIProvider({ baseUrl: config.baseUrl, apiKey: config.apiKey }),
     model: config.model,
-    tools: builtinTools({ policy }),
+    tools,
     workspace,
     exec: sandbox.exec,
-    systemPrompt: buildSystemPrompt(workspace, config.systemExtra),
+    // 项目约定与 CLI 走同一条路径：桌面端与终端看到的系统提示必须是同一个
+    systemPrompt: buildSystemPrompt(workspace, config.systemExtra, loadProjectMemory(workspace)),
+    // RPC 宿主没有人可以问：确认闸门不装，MCP 工具因此只认 --mcp-allow 放行列表
     maxTurns: config.maxTurns,
     maxTokens: config.maxTokens,
     temperature: config.temperature,
@@ -83,6 +117,12 @@ export async function startRpcHost(opts: { workspace?: string; model?: string } 
     model: config.model,
     sandbox: sandbox.describe(),
     isolated: sandbox.isolated,
+    projectMemory: loadProjectMemory(workspace)?.path ?? null,
+    knowledge: knowledgeConfigured({ url: config.knowledgeUrl }),
+    mcpTools: tools.filter((t) => t.name.startsWith("mcp__")).length,
+    mcpNotes,
+    // 桌面端要知道：MCP 工具在这里只认放行列表，发起调用前得自己确认过
+    mcpConfirm: config.mcp ? "allowlist" : "off",
   });
 
   process.stdin.setEncoding("utf8");
@@ -100,6 +140,7 @@ export async function startRpcHost(opts: { workspace?: string; model?: string } 
   });
 
   process.stdin.on("end", () => {
+    for (const c of mcpClients) void c.close();
     process.exit(0);
   });
 
@@ -163,6 +204,7 @@ export async function startRpcHost(opts: { workspace?: string; model?: string } 
       case "shutdown": {
         shuttingDown = true;
         writeLine({ type: "response", id, ok: true, result: { bye: true } });
+        for (const c of mcpClients) await c.close();
         process.exit(0);
         return;
       }

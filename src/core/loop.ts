@@ -16,6 +16,7 @@ import type {
   AgentSnapshot,
   AgentState,
   ChatMessage,
+  ConfirmRequest,
   ExecFn,
   LoopRecord,
   Provider,
@@ -56,6 +57,8 @@ export interface LoopOptions {
   onEvent?: (event: AgentEvent) => void;
   /** 上下文压缩策略；不传则永不压缩 */
   compaction?: CompactConfig;
+  /** 外部动作的确认闸门。不传时 MCP 之类的外部工具会按「无人确认」拒绝执行 */
+  confirm?: (req: ConfirmRequest) => Promise<boolean>;
   /** 消息流钩子：会话落盘、审计、GUI 历史同步都接这里 */
   onRecord?: (record: LoopRecord) => void;
 }
@@ -102,6 +105,15 @@ export class AgentLoop {
   /** 替换事件处理器（CLI / RPC / GUI 各自接自己的出口） */
   setEventHandler(fn: (event: AgentEvent) => void): void {
     this.opts.onEvent = fn;
+  }
+
+  /**
+   * 装/卸确认闸门。
+   * 交互模式在 readline 就绪之后才能问，而 loop 在 buildRuntime 里就建好了，
+   * 所以留一个后置入口；不装 = 无人确认，MCP 工具会自行拒绝。
+   */
+  setConfirm(fn: ((req: ConfirmRequest) => Promise<boolean>) | undefined): void {
+    this.opts.confirm = fn;
   }
 
   getSnapshot(): AgentSnapshot {
@@ -398,6 +410,7 @@ export class AgentLoop {
         exec: this.opts.exec,
         signal: this.controller?.signal,
         onProgress: (t) => this.emit({ type: "text_delta", text: t }),
+        ...(this.opts.confirm ? { confirm: this.opts.confirm } : {}),
       });
       this.emit({
         type: "tool_end",

@@ -15,11 +15,26 @@ export interface CliFlags {
   isolation?: "auto" | "appcontainer" | "bwrap" | "docker" | "none";
   network?: boolean;
   dockerImage?: string;
+  knowledgeUrl?: string;
+  knowledgeToken?: string;
+  mcp?: boolean;
+  mcpConfigFile?: string;
+  mcpAllow?: string[];
   rest: string[];
 }
 
 /** 需要取一个值的参数名，单独列出来便于统一做「缺值报错」 */
-const VALUED = ["--workspace", "--model", "--sandbox", "--isolation", "--docker-image"] as const;
+const VALUED = [
+  "--workspace",
+  "--model",
+  "--sandbox",
+  "--isolation",
+  "--docker-image",
+  "--knowledge",
+  "--kb-token",
+  "--mcp-config",
+  "--mcp-allow",
+] as const;
 type Valued = (typeof VALUED)[number];
 
 export function parseFlags(rest: string[]): CliFlags {
@@ -34,6 +49,7 @@ export function parseFlags(rest: string[]): CliFlags {
     if (a === "--json") out.json = true;
     else if (a === "--no-save") out.noSave = true;
     else if (a === "--network") out.network = true;
+    else if (a === "--mcp") out.mcp = true;
     else if ((VALUED as readonly string[]).includes(a)) {
       const value = rest[i + 1];
       // 缺值时报错，不静默变成 undefined：否则 `--workspace` 写在末尾就等于没写
@@ -57,6 +73,21 @@ export function parseFlags(rest: string[]): CliFlags {
           break;
         case "--docker-image":
           out.dockerImage = value;
+          break;
+        case "--knowledge":
+          out.knowledgeUrl = value;
+          break;
+        case "--kb-token":
+          out.knowledgeToken = value;
+          break;
+        case "--mcp-config":
+          out.mcpConfigFile = value;
+          break;
+        case "--mcp-allow":
+          out.mcpAllow = value
+            .split(",")
+            .map((x) => x.trim())
+            .filter(Boolean);
           break;
       }
       i++;

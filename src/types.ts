@@ -54,6 +54,18 @@ export interface ToolContext {
   exec: ExecFn;
   signal?: AbortSignal;
   onProgress?: (text: string) => void;
+  /**
+   * 外部动作的确认闸门。不传等于「没有人工在场」——必须按拒绝处理，
+   * 不能默认放行：MCP 工具跑在飞码的策略层之外，凭据、网络、文件都可能是它自己管的。
+   */
+  confirm?: (req: ConfirmRequest) => Promise<boolean>;
+}
+
+export interface ConfirmRequest {
+  /** 一句话说明要做什么，例如「执行 MCP 工具 github.create_issue」 */
+  title: string;
+  /** 细节：参数、影响范围、为什么需要确认 */
+  detail: string;
 }
 
 export interface Tool {
