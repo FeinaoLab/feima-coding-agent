@@ -129,7 +129,8 @@ test("轮次不足或内容太少时明确拒绝，不产出半成品", async ()
   const msgs: ChatMessage[] = [m("system", "sys"), m("user", "只问了一句"), m("assistant", "答")];
   const res = await compactIfNeeded(msgs, { budget: 0, keepRecentTurns: 3 });
   assert.equal(res.compacted, false);
-  assert.match(res.reason ?? "", /不足|太少/);
+  // 只有 3 条时无论按轮次还是按 token 都切不出安全边界
+  assert.match(res.reason ?? "", /切分点|不足|过少|太少/);
 });
 
 test("降级摘要保留关键动作，不编造结论", () => {
@@ -143,4 +144,141 @@ test("降级摘要保留关键动作，不编造结论", () => {
   assert.ok(text.includes("帮我跑一次测试"));
   assert.ok(text.includes("bash"));
   assert.ok(text.includes("需要时重新读取"));
+});
+
+/** 单轮长工具链：只有一条 user，构造 30 组 assistant(tool_calls)+tool */
+function singleTurnChain(rounds: number): ChatMessage[] {
+  const out: ChatMessage[] = [m("system", "你是飞码"), m("user", "把 src 下所有文件读一遍")];
+  for (let i = 1; i <= rounds; i++) {
+    out.push(m("assistant", null, { tool_calls: [{ id: `call_${i}`, name: "read", arguments: `{"path":"src/f${i}.ts"}` }] }));
+    out.push(m("tool", longText(500), { tool_call_id: `call_${i}`, name: "read" }));
+  }
+  return out;
+}
+
+test("单轮长工具链：按用户轮次找不到切点，改按 token 保留尾部", async () => {
+  const msgs = singleTurnChain(30);
+  assert.equal(msgs.filter((x) => x.role === "user").length, 1, "前提：这轮只有一条用户消息");
+
+  const res = await compactIfNeeded(msgs, { budget: 2000, keepRecentTurns: 3, keepTokens: 1000 });
+  assert.equal(res.compacted, true, "只有一条 user 时也必须能压，否则长工具链会一路涨到上游报超长");
+  assert.ok(res.after < res.before);
+  assert.ok(res.folded >= 20, `应折掉大部分历史，实际 ${res.folded}`);
+  assert.equal(res.messages[0].role, "system");
+  assert.ok(res.messages[1].content?.startsWith(SUMMARY_MARK));
+  assert.equal(res.messages.filter((x) => x.role === "user" && x.content?.startsWith(SUMMARY_MARK)).length, 1);
+});
+
+test("单轮长工具链的切点不落在 tool 结果上：折叠后配对完整", async () => {
+  const msgs = singleTurnChain(30);
+  const res = await compactIfNeeded(msgs, { budget: 2000, keepRecentTurns: 3, keepTokens: 1000 });
+  assert.equal(res.compacted, true);
+
+  const pending = new Set<string>();
+  for (const msg of res.messages.slice(1)) {
+    if (msg.role === "assistant" && msg.tool_calls?.length) {
+      assert.equal(pending.size, 0);
+      for (const c of msg.tool_calls) pending.add(c.id);
+    } else if (msg.role === "tool") {
+      assert.ok(pending.has(msg.tool_call_id ?? ""), `孤立 tool：${msg.tool_call_id}`);
+      pending.delete(msg.tool_call_id ?? "");
+    } else if (pending.size) {
+      assert.fail(`${msg.role} 插在 tool_calls 与结果之间`);
+    }
+  }
+  assert.equal(pending.size, 0, "尾部不能留下没有结果的调用");
+});
+
+test("连续多次压缩只保留一条摘要，旧摘要并入新摘要", async () => {
+  let round = 0;
+  const seenPrevious: (string | null)[] = [];
+  let msgs = singleTurnChain(20);
+
+  // 压三次，每次再追加一段新历史，模拟长会话持续推进
+  for (let k = 0; k < 3; k++) {
+    const res = await compactIfNeeded(msgs, {
+      budget: 2000,
+      keepRecentTurns: 2,
+      keepTokens: 800,
+      summarize: async (_folded, previous) => {
+        seenPrevious.push(previous);
+        return `第 ${++round} 次摘要，包含旧摘要 ${previous ? "是" : "否"}`;
+      },
+    });
+    msgs = res.messages;
+    for (let i = 1; i <= 6; i++) {
+      const id = `extra_${k}_${i}`;
+      msgs = [
+        ...msgs,
+        m("assistant", null, { tool_calls: [{ id, name: "read", arguments: "{}" }] }),
+        m("tool", longText(500), { tool_call_id: id, name: "read" }),
+      ];
+    }
+  }
+
+  const summaries = msgs.filter((x) => x.role === "user" && x.content?.startsWith(SUMMARY_MARK));
+  assert.equal(summaries.length, 1, `摘要必须始终只有一条，实际 ${summaries.length}`);
+  assert.ok(msgs[0].content === "你是飞码");
+  assert.equal(seenPrevious[0], null, "第一次没有旧摘要");
+  assert.ok(seenPrevious.slice(1).every((p) => p !== null), "后续压缩必须把旧摘要带进去合并");
+});
+
+test("一次请求甩出多个工具调用时，折叠区条数很少但体积够，也要能压", async () => {
+  // 真机跑出来的形态：模型一口气发 7 个 write_file，历史只有
+  // user → assistant(7 calls) → 7×tool。切点只能落在 assistant 上，
+  // 折叠区只有一条 user，按"条数<3"的老门槛会被判为内容不足，永远不压。
+  const calls = Array.from({ length: 7 }, (_, i) => ({
+    id: `c${i}`,
+    name: "write_file",
+    arguments: JSON.stringify({ path: `works/note-0${i}.md`, content: longText(300) }),
+  }));
+  const msgs: ChatMessage[] = [
+    m("system", "你是飞码"),
+    m("user", longText(500)),
+    m("assistant", null, { tool_calls: calls }),
+    ...calls.map((c) => m("tool", "已写入", { tool_call_id: c.id, name: "write_file" })),
+  ];
+
+  const before = estimateMessages(msgs);
+  const res = await compactIfNeeded(msgs, { budget: 900, keepRecentTurns: 1, keepTokens: 300, summarize: async () => "已建 7 个文件" });
+  assert.equal(res.compacted, true, `应能压缩，before=${before}`);
+  assert.ok(res.folded >= 1, "至少折掉那条很长的任务描述");
+  assert.ok(res.after < res.before);
+
+  // 尾部必须自洽：每个 tool 结果都要能找到对应的 token_calls 请求
+  const pending = new Set<string>();
+  for (const msg of res.messages.slice(1)) {
+    if (msg.role === "assistant" && msg.tool_calls?.length) {
+      assert.equal(pending.size, 0);
+      for (const c of msg.tool_calls) pending.add(c.id);
+    } else if (msg.role === "tool") {
+      assert.ok(pending.has(msg.tool_call_id ?? ""), `孤立 tool：${msg.tool_call_id}`);
+      pending.delete(msg.tool_call_id ?? "");
+    } else if (pending.size) {
+      assert.fail(`${msg.role} 插在 tool_calls 与结果之间`);
+    }
+  }
+  assert.equal(pending.size, 0);
+});
+
+test("折叠区体积太小时拒绝压缩，避免为几百 token 花一次摘要调用", async () => {
+  const msgs: ChatMessage[] = [
+    m("system", "sys"),
+    m("user", "短问题"),
+    m("assistant", "短回答"),
+    m("user", "再来一句"),
+    m("assistant", "好的"),
+  ];
+  let called = false;
+  const res = await compactIfNeeded(msgs, {
+    budget: 1,
+    keepRecentTurns: 1,
+    summarize: async () => {
+      called = true;
+      return "摘要";
+    },
+  });
+  assert.equal(res.compacted, false);
+  assert.equal(called, false, "内容太少时不该调用摘要模型");
+  assert.match(res.reason ?? "", /过少|切分点/);
 });

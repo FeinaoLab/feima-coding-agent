@@ -18,6 +18,9 @@ export const SUMMARY_MARK = "[上下文摘要";
 
 const MESSAGE_OVERHEAD = 4;
 
+/** 折叠区低于这个估算体积就不值得花一次摘要调用 */
+const MIN_FOLD_TOKENS = 240;
+
 /**
  * 粗略 token 估算：中日韩字符按 1.05、其余按 3.6 字符估。
  * 不追求精确——用于触发判断，误差 15% 以内就够；真正计费以 usage 为准。
@@ -56,6 +59,11 @@ export interface CompactConfig {
   budget: number;
   /** 保留最近多少个用户轮次（含其后所有消息） */
   keepRecentTurns: number;
+  /**
+   * 找不到足够用户轮次时（典型是「一轮任务里跑了 30 次工具」），
+   * 按 token 保留尾部这么多内容。默认取预算的一半。
+   */
+  keepTokens?: number;
   /** 摘要生成器；抛错时自动降级为规则摘要 */
   summarize?: (folded: ChatMessage[], previous: string | null) => Promise<string>;
 }
@@ -149,14 +157,69 @@ export function makeSummarizer(
 }
 
 /** 从尾部数第 n 个 user 消息的下标；不足返回 -1 */
-function findCut(messages: ChatMessage[], keepRecentTurns: number): number {
+function isSummaryMessage(m: ChatMessage): boolean {
+  return m.role === "user" && typeof m.content === "string" && m.content.startsWith(SUMMARY_MARK);
+}
+
+/**
+ * 安全的切分点：不能落在 tool 结果上。
+ * 切在 tool 上意味着 assistant(tool_calls) 被折进去而结果还留着，
+ * 上游会报 tool_call_id 找不到对应请求，整轮直接 400。
+ */
+function isSafeCut(messages: ChatMessage[], i: number): boolean {
+  // 2 是允许的最小值：折叠区 = [1, 2) 正好是一条 user。
+  // 体积门槛在 compactIfNeeded 里判，这里只管结构是否安全。
+  if (i < 2 || i >= messages.length) return false;
+  return messages[i].role !== "tool";
+}
+
+/**
+ * 找切点，两种策略：
+ * 1. 用户轮次（多轮对话的常态）：保留最近 keepRecentTurns 个完整轮次。
+ * 2. token 保留（单轮长工具链）：一轮任务里跑了 30 次工具时只有一条 user，
+ *    按轮次算永远找不到切点，上下文会一路涨到上游报超长。
+ *    这时改成从尾部往前累积，保留 keepTokens 的内容，切点在安全边界上。
+ */
+function findCut(messages: ChatMessage[], cfg: CompactConfig, budget: number): number {
+  const keep = Math.max(1, cfg.keepRecentTurns);
   let seen = 0;
   for (let i = messages.length - 1; i > 0; i--) {
-    if (messages[i].role === "user") {
-      seen++;
-      if (seen === keepRecentTurns) return i;
+    const m = messages[i];
+    if (m.role !== "user" || isSummaryMessage(m)) continue;
+    seen++;
+    if (seen === keep) {
+      if (isSafeCut(messages, i)) return i;
+      break;
     }
   }
+
+  // 保留量不能超过预算的八成，否则「保留区本身就超预算」，每次请求前都要压一遍
+  const reserve = Math.min(
+    Math.max(200, cfg.keepTokens ?? Math.floor(budget * 0.5)),
+    Math.max(200, Math.floor(budget * 0.8)),
+  );
+  let acc = 0;
+  let start = -1;
+  for (let i = messages.length - 1; i >= 2; i--) {
+    acc += estimateMessage(messages[i]);
+    if (acc >= reserve) {
+      start = i;
+      break;
+    }
+  }
+  // 尾部全部加起来还不够 reserve（例如一条超长的任务描述 + 一组短工具结果）：
+  // 那就只折掉那条任务描述，保留整组工具调用。切点仍然合法。
+  if (start < 0) start = 2;
+
+  // 起点若是 tool，右移到整组结束，宁可多留也不切断配对
+  let cut = start;
+  while (cut < messages.length && messages[cut]?.role === "tool") cut++;
+  if (isSafeCut(messages, cut)) return cut;
+
+  // 右移越过了尾部（整组都在保留区里）：退回这组开头
+  cut = start;
+  while (cut > 2 && messages[cut]?.role === "tool") cut--;
+  if (isSafeCut(messages, cut)) return cut;
   return -1;
 }
 
@@ -180,18 +243,19 @@ export async function compactIfNeeded(
   if (messages.length <= 2) return unchanged("消息太少");
   if (before <= cfg.budget) return unchanged("未超预算");
 
-  const keep = Math.max(1, cfg.keepRecentTurns);
-  const cut = findCut(messages, keep);
-  if (cut < 0) return unchanged(`不足 ${keep} 个完整轮次`);
+  const cut = findCut(messages, cfg, cfg.budget);
+  if (cut < 0) return unchanged("找不到安全的切分点");
 
   const foldedAll = messages.slice(1, cut);
-  const previousMsg = foldedAll.find(
-    (m) => m.role === "user" && typeof m.content === "string" && m.content.startsWith(SUMMARY_MARK),
-  );
+  const previousMsg = foldedAll.find((m) => isSummaryMessage(m));
   const previous = previousMsg?.content ?? null;
   const body = foldedAll.filter((m) => m !== previousMsg);
 
-  if (body.length < 3) return unchanged("可折叠内容不足");
+  if (!body.length) return unchanged("没有可折叠内容");
+  // 门槛看体积而不是条数：一次请求里甩出七八个工具调用时，折叠区可能只有
+  // 「一条 user + 一条 assistant(tool_calls) + 若干 tool」，条数很少但体积很大。
+  // 反过来，为了省两百 token 花一次摘要调用不划算，所以给个体积下限。
+  if (estimateMessages(body) < MIN_FOLD_TOKENS) return unchanged("可折叠内容过少");
 
   let summary: string;
   if (cfg.summarize) {

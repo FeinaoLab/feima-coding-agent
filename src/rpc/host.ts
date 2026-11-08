@@ -34,8 +34,8 @@ function writeLine(obj: unknown): void {
   process.stdout.write(JSON.stringify(obj) + "\n");
 }
 
-export async function startRpcHost(opts: { workspace?: string } = {}): Promise<number> {
-  const config = loadConfig({ workspace: opts.workspace ?? loadConfig().workspace });
+export async function startRpcHost(opts: { workspace?: string; model?: string } = {}): Promise<number> {
+  const config = loadConfig({ workspace: opts.workspace, model: opts.model });
   const workspace = assertWorkspace(config.workspace);
   const policy = defaultPolicy({ workspace });
   const sandbox = createSandbox({ mode: config.sandbox, policy });
@@ -59,7 +59,11 @@ export async function startRpcHost(opts: { workspace?: string } = {}): Promise<n
     maxTokens: config.maxTokens,
     temperature: config.temperature,
     // 桌面端会话往往更长，压缩必须和 CLI 一致，否则同一段历史两边表现不同
-    compaction: { budget: config.contextBudget, keepRecentTurns: config.keepRecentTurns },
+    compaction: {
+      budget: config.contextBudget,
+      keepRecentTurns: config.keepRecentTurns,
+      ...(config.keepTokens > 0 ? { keepTokens: config.keepTokens } : {}),
+    },
   });
 
   loop.setEventHandler((event) => writeLine({ type: "event", event }));

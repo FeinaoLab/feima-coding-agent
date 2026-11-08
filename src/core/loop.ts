@@ -37,6 +37,10 @@ import {
 const TRUNCATED_NOTE =
   "错误：上一次输出达到长度上限，工具参数可能被截断，本次调用未执行。请缩短参数（例如分次写入或减少改动量）后重新调用。";
 
+const TRUNCATED_EMPTY_NOTE =
+  "错误：上一次输出达到长度上限，既没有正文也没有工具调用（推理型模型常把 token 全花在思考上）。" +
+  "请直接开始执行，不要长篇推理；如果任务较大，先做第一步。";
+
 export type LoopOutcome = "done" | "aborted" | "error";
 
 export interface LoopOptions {
@@ -247,6 +251,7 @@ export class AgentLoop {
   private async inner(): Promise<LoopOutcome> {
     const maxRounds = this.opts.maxTurns ?? 40;
     let rounds = 0;
+    let emptyTruncations = 0;
 
     while (rounds < maxRounds) {
       rounds++;
@@ -268,6 +273,21 @@ export class AgentLoop {
       const calls = res.message.tool_calls ?? [];
 
       if (!calls.length) {
+        // 输出被长度上限截断且什么都没产出（推理型模型把额度全花在 reasoning 上）：
+        // 直接当成"完成"会让 Agent 一句话不说就收工，用户以为它干完了，其实什么都没做。
+        if (res.finish === "length") {
+          emptyTruncations++;
+          if (emptyTruncations > 2) {
+            this.emit({
+              type: "error",
+              message: `连续 ${emptyTruncations} 次输出被长度上限截断且没有产生任何内容或工具调用，请调大 maxTokens（当前 ${this.opts.maxTokens ?? "默认"}）`,
+              retryable: false,
+            });
+            return "error";
+          }
+          this.push({ role: "user", content: TRUNCATED_EMPTY_NOTE });
+          continue;
+        }
         // 没有工具调用：只有没有待处理插话时才算这一轮结束
         if (this.steering.length) continue;
         return "done";

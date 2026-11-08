@@ -351,3 +351,41 @@ test("restore 后继续提问：历史被带上，且系统提示用当前配置
   assert.equal(sent[sent.length - 1].content, "新一轮");
   assert.equal(loop.getHistory().filter((m) => m.role === "system").length, 1);
 });
+
+test("空输出被长度截断时不当成完成，回灌提示让模型重来", async () => {
+  // 推理型模型把 max_tokens 全花在 reasoning 上会走到这里：
+  // 没有正文、没有工具调用，旧实现直接 return "done"，用户以为干完了
+  const scripts: Script[] = [
+    async function* () {
+      yield { finish: "length" };
+    },
+    async function* () {
+      yield { text: "这次直接干。" };
+      yield { finish: "stop" };
+    },
+  ];
+
+  const { provider, loop, events } = build(scripts, []);
+  const outcome = await loop.submit("写个函数");
+
+  assert.equal(outcome, "done");
+  assert.equal(provider.requests.length, 2, "截断后必须再请求一次");
+  const nudge = provider.requests[1].messages.at(-1);
+  assert.equal(nudge?.role, "user");
+  assert.match(String(nudge?.content), /长度上限/);
+  assert.equal(events.filter((e) => e.type === "error").length, 0);
+});
+
+test("连续空输出截断三次后报错，不无限重试", async () => {
+  const empty: Script = async function* () {
+    yield { finish: "length" };
+  };
+  const { provider, loop, events } = build([empty, empty, empty, empty, empty], []);
+  const outcome = await loop.submit("一直想不说话");
+
+  assert.equal(outcome, "error");
+  assert.equal(provider.requests.length, 3, "重试两次后第三次报错");
+  const err = events.find((e) => e.type === "error");
+  assert.match(String(err && "message" in err ? err.message : ""), /maxTokens|截断/);
+  assert.equal(loop.getSnapshot().isStreaming, false);
+});

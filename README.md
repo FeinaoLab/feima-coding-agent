@@ -84,16 +84,17 @@ FEIMA_BASE_URL=http://localhost:11434/v1 FEIMA_API_KEY=ollama FEIMA_MODEL=qwen3:
 规则：
 
 1. 系统提示永不折叠；
-2. 切分点只落在 `user` 消息上，`assistant(tool_calls)` 与 `tool` 结果永远成对保留；
+2. 切分点不会落在 `tool` 消息上，`assistant(tool_calls)` 与 `tool` 结果永远成对保留；
 3. 最近 `keepRecentTurns`（默认 3）轮原样保留；
-4. 压缩后如果没有变小，就放弃这次压缩；
-5. 摘要失败时降级为规则摘要（只列诉求、工具、结论），不会让整轮失败。
+4. 一轮任务里跑了几十次工具、没有足够用户轮次时，改按 `keepTokens`（默认取预算一半）保留尾部；
+5. 压缩后如果没有变小，就放弃这次压缩；
+6. 摘要失败时降级为规则摘要（只列诉求、工具、结论），不会让整轮失败。
 
 ```
 [上下文折叠] 8 条消息 → 摘要，5.6k → 1.2k tokens
 ```
 
-可调：`FEIMA_CONTEXT_BUDGET=16000`、`FEIMA_KEEP_TURNS=2`。
+可调：`FEIMA_CONTEXT_BUDGET=16000`、`FEIMA_KEEP_TURNS=2`、`FEIMA_KEEP_TOKENS=6000`。
 
 ## 会话持久化
 
@@ -189,7 +190,8 @@ npm run typecheck # 需要另装 typescript（可选，开发期依赖）
 ## 路线
 
 v0.1：核心循环、工具、策略层安全、CLI、RPC。
-v0.2（当前）：上下文压缩、会话持久化。
+v0.2：上下文压缩、会话持久化。
+v0.2.1（当前）：长任务验收补做，修掉「单轮长工具链不压缩」「空输出截断判完成」「`--workspace` 失效」。
 v0.3：重试策略、工具确认、多模型配置、真实隔离后端。
 v1.0：Electron 桌面端，复用 `feima rpc`，不重写引擎。
 

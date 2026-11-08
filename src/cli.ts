@@ -25,9 +25,10 @@ import { builtinTools } from "./tools/builtin.ts";
 import { assertWorkspace, defaultPolicy, redact } from "./safety/policy.ts";
 import { createSandbox, handshake, describePlatform } from "./safety/exec.ts";
 import { startRpcHost } from "./rpc/host.ts";
+import { parseFlags } from "./cli/flags.ts";
 import type { AgentEvent, ChatMessage } from "./types.ts";
 
-const VERSION = "0.2.0";
+const VERSION = "0.2.1";
 
 interface Runtime {
   config: ReturnType<typeof loadConfig>;
@@ -36,8 +37,13 @@ interface Runtime {
   session: SessionStore | null;
 }
 
-async function buildRuntime(session: SessionStore | null, workspace?: string): Promise<Runtime> {
-  const config = loadConfig({ workspace: workspace ?? loadConfig().workspace });
+interface RuntimeOpts {
+  workspace?: string;
+  model?: string;
+}
+
+async function buildRuntime(session: SessionStore | null, opts: RuntimeOpts = {}): Promise<Runtime> {
+  const config = loadConfig({ workspace: opts.workspace, model: opts.model });
   const ws = assertWorkspace(config.workspace);
   const policy = defaultPolicy({ workspace: ws });
   const sandbox = createSandbox({ mode: config.sandbox, policy });
@@ -56,7 +62,11 @@ async function buildRuntime(session: SessionStore | null, workspace?: string): P
     maxTurns: config.maxTurns,
     maxTokens: config.maxTokens,
     temperature: config.temperature,
-    compaction: { budget: config.contextBudget, keepRecentTurns: config.keepRecentTurns },
+    compaction: {
+      budget: config.contextBudget,
+      keepRecentTurns: config.keepRecentTurns,
+      ...(config.keepTokens > 0 ? { keepTokens: config.keepTokens } : {}),
+    },
     onRecord: session
       ? (rec) => {
           if (rec.kind === "message") session.appendMessage(rec.message);
@@ -122,7 +132,11 @@ async function doctor(): Promise<number> {
   } catch (err) {
     console.log("会话目录   ", `不可用：${err instanceof Error ? err.message : String(err)}`);
   }
-  console.log("上下文预算 ", `${config.contextBudget} tokens，保留最近 ${config.keepRecentTurns} 轮`);
+  console.log(
+    "上下文预算 ",
+    `${config.contextBudget} tokens，保留最近 ${config.keepRecentTurns} 轮` +
+      `（单轮长工具链按 ${config.keepTokens || Math.floor(config.contextBudget / 2)} tokens 保留尾部）`,
+  );
   console.log("会话保存   ", config.saveSession ? "开启" : "关闭");
 
   if (!config.apiKey || config.apiKey.includes("在这里填")) {
@@ -134,8 +148,13 @@ async function doctor(): Promise<number> {
   return ok ? 0 : 1;
 }
 
-async function runOnce(task: string, json: boolean, session: SessionStore | null): Promise<number> {
-  const rt = await buildRuntime(session);
+async function runOnce(
+  task: string,
+  json: boolean,
+  session: SessionStore | null,
+  opts: RuntimeOpts = {},
+): Promise<number> {
+  const rt = await buildRuntime(session, opts);
   if (!json) console.log(`▸ 工作区 ${rt.config.workspace}\n▸ 模型 ${rt.config.model}`);
   if (!json && session) console.log(`▸ 会话 ${session.id}`);
   if (!json) console.log("");
@@ -202,9 +221,12 @@ function printResumeBanner(loop: AgentLoop, session: SessionStore, loaded: Retur
   console.log("");
 }
 
-async function interactive(opts: { session?: SessionStore | null; resume?: boolean } = {}): Promise<number> {
-  const session = opts.session === undefined ? newSession(loadConfig()) : opts.session;
-  const rt = await buildRuntime(session);
+async function interactive(
+  opts: { session?: SessionStore | null; resume?: boolean } & RuntimeOpts = {},
+): Promise<number> {
+  const session =
+    opts.session === undefined ? newSession(loadConfig({ workspace: opts.workspace, model: opts.model })) : opts.session;
+  const rt = await buildRuntime(session, opts);
   const cfg = rt.config;
 
   if (session && opts.resume !== false && opts.session) {
@@ -386,8 +408,8 @@ function printSessionTable(list: ReturnType<typeof SessionStore.list>): void {
   if (list.length > 20) console.log(`… 另有 ${list.length - 20} 个，feima sessions --json 查看全部`);
 }
 
-async function resumeSession(id: string): Promise<number> {
-  const cfg = loadConfig();
+async function resumeSession(id: string, opts: RuntimeOpts = {}): Promise<number> {
+  const cfg = loadConfig({ workspace: opts.workspace, model: opts.model });
   let store: SessionStore;
   try {
     store = SessionStore.open(id);
@@ -400,7 +422,7 @@ async function resumeSession(id: string): Promise<number> {
   if (path.resolve(loaded.meta.workspace) !== path.resolve(cfg.workspace)) {
     console.log(`\x1b[33m注意：该会话原工作区为 ${loaded.meta.workspace}，当前工作区 ${cfg.workspace}\x1b[0m`);
   }
-  return interactive({ session: store, resume: true });
+  return interactive({ session: store, resume: true, ...opts });
 }
 
 function sessionsCommand(args: string[], json: boolean): number {
@@ -447,7 +469,8 @@ function usage(): void {
 
 环境变量：
   FEIMA_API_KEY / FEIMA_BASE_URL / FEIMA_MODEL / FEIMA_WORKSPACE / FEIMA_SANDBOX
-  FEIMA_CONTEXT_BUDGET（默认 22000）/ FEIMA_KEEP_TURNS（默认 3）/ FEIMA_NO_SAVE
+  FEIMA_CONTEXT_BUDGET（默认 22000）/ FEIMA_KEEP_TURNS（默认 3）
+  FEIMA_KEEP_TOKENS（单轮长工具链保留的尾部 token，默认取预算一半）/ FEIMA_NO_SAVE
   FEIMA_HOME（覆盖 ~/.feima）
 `);
 }
@@ -474,46 +497,24 @@ async function main(argv: string[]): Promise<number> {
     return 0;
   }
   if (cmd === "doctor") return doctor();
-  if (cmd === "rpc") return startRpcHost({ workspace: flags.workspace });
+  if (cmd === "rpc") return startRpcHost({ workspace: flags.workspace, model: flags.model });
   if (cmd === "sessions") return sessionsCommand(flags.rest, flags.json);
-  if (cmd === "resume") return resumeSession(flags.rest[0] ?? "last");
+  if (cmd === "resume")
+    return resumeSession(flags.rest[0] ?? "last", { workspace: flags.workspace, model: flags.model });
   if (cmd === "run") {
     const task = flags.rest.join(" ").trim();
     if (!task) {
       console.error("缺少任务描述，例如：feima run \"把 README 里的 TODO 补完\"");
       return 2;
     }
-    const cfg = loadConfig(saveOverride);
-    return runOnce(task, flags.json, newSession(cfg));
+    // 会话的 meta.workspace 必须与 --workspace 一致，否则列表里记的是另一个目录
+    const cfg = loadConfig({ ...saveOverride, workspace: flags.workspace, model: flags.model });
+    return runOnce(task, flags.json, newSession(cfg), { workspace: cfg.workspace, model: cfg.model });
   }
 
   // 兜底：按一次性任务处理，方便 feima "直接说需求"
-  return runOnce(args.join(" "), false, newSession(loadConfig(saveOverride)));
-}
-
-function parseFlags(rest: string[]): {
-  json: boolean;
-  noSave: boolean;
-  workspace?: string;
-  rest: string[];
-  model?: string;
-} {
-  const out = {
-    json: false,
-    noSave: false,
-    rest: [] as string[],
-    workspace: undefined as string | undefined,
-    model: undefined as string | undefined,
-  };
-  for (let i = 0; i < rest.length; i++) {
-    const a = rest[i];
-    if (a === "--json") out.json = true;
-    else if (a === "--no-save") out.noSave = true;
-    else if (a === "--workspace") out.workspace = rest[++i];
-    else if (a === "--model") out.model = rest[++i];
-    else out.rest.push(a);
-  }
-  return out;
+  const cfg = loadConfig({ ...saveOverride, workspace: flags.workspace, model: flags.model });
+  return runOnce(flags.rest.join(" "), false, newSession(cfg), { workspace: cfg.workspace, model: cfg.model });
 }
 
 main(process.argv)

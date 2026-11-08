@@ -4,7 +4,8 @@
 
 ## 项目结构
 
-- `src/cli.ts`：命令行入口，只做参数解析与事件渲染，不写业务逻辑。
+- `src/cli.ts`：命令行入口，只做命令分发与事件渲染，不写业务逻辑。
+- `src/cli/flags.ts`：参数解析。独立成文件是为了能测——`cli.ts` import 即执行 `main()`，藏在里面的解析逻辑永远测不到。
 - `src/core/`：循环、状态机、上下文压缩、会话持久化。
   - 改 `loop.ts` 必须同步改 `tests/loop.test.ts`；
   - 改 `compact.ts` 必须保证 `assistant(tool_calls)` 与 `tool` 结果不被拆开，用例在 `tests/compact.test.ts`；
@@ -46,11 +47,17 @@ node src/cli.ts --help    # 改 CLI 参数后确认输出
 
 - 任何写消息的地方都必须走 `AgentLoop.push()`，禁止直接 `this.messages.push(...)`。
   绕过它会导致"历史里有、会话文件里没有"，恢复出来的会话是断的。
-- 压缩切分点只允许落在 `role === "user"` 的位置。`tool` 消息永远不能位于折叠边界的新区首位。
+- 压缩切分点不能落在 `role === "tool"` 上。`assistant(tool_calls)` 与紧随的 `tool` 结果是原子对，切在中间上游直接 400。按轮次找不到切点时必须走 token 兜底，不允许直接放弃压缩（单轮长工具链会因此完全不压）。
+- 摘要消息是 `role: "user"`，必须排除在"用户轮次"计数外（按 `[上下文摘要` 前缀识别）。否则二次压缩的切点会算到摘要前面，折叠区只剩一条摘要，压缩永久停滞。
 - 系统提示永不进入摘要；恢复会话时用当前配置重新生成，不沿用文件里那条。
 - 摘要生成失败必须降级为 `fallbackSummary()`，不允许把异常抛给用户，也不允许"压一半就返回"。
 - 会话文件目录只由 `defaultSessionDir()` 决定，测试一律传临时目录，禁止写到真实 `~/.feima`。
 - append 之前必须确保文件末尾有换行（`ensureTrailingNewline`）；新增写入路径时同样处理。
+
+## CLI 参数约定
+
+- 新增 `--xxx` 参数必须：① 在 `flags.ts` 加解析并补用例；② 在 `usage()` 里写清；③ 确认它真的被**传给运行时**。
+- "解析出来但没人用"是本项目踩过的真实 bug：`--workspace` 解析正确，`run`/`resume` 却没传给 `buildRuntime`，Agent 在 cwd 里改文件，没有任何报错。参数缺值必须报错，不允许静默变成 `undefined`。
 
 ## 提交规范
 

@@ -23,6 +23,8 @@ export interface FeimaConfig {
   contextBudget: number;
   /** 压缩时保留最近多少个用户轮次 */
   keepRecentTurns: number;
+  /** 单轮长工具链找不到轮次切点时，按 token 保留尾部内容；0 表示取预算的一半 */
+  keepTokens: number;
   /** 是否把会话写入 ~/.feima/sessions */
   saveSession: boolean;
 }
@@ -100,6 +102,7 @@ export function loadConfig(overrides: Partial<FeimaConfig> = {}): FeimaConfig {
     systemExtra: pickStr(overrides.systemExtra, env.FEIMA_SYSTEM_EXTRA, typeof file.systemExtra === "string" ? file.systemExtra : ""),
     contextBudget: pickNum(22000, overrides.contextBudget, env.FEIMA_CONTEXT_BUDGET, file.contextBudget),
     keepRecentTurns: Math.max(1, pickNum(3, overrides.keepRecentTurns, env.FEIMA_KEEP_TURNS, file.keepRecentTurns)),
+    keepTokens: Math.max(0, pickNum(0, overrides.keepTokens, env.FEIMA_KEEP_TOKENS, file.keepTokens)),
     saveSession: env.FEIMA_NO_SAVE ? false : (overrides.saveSession ?? file.saveSession ?? true) !== false,
   };
 }
@@ -119,6 +122,7 @@ export function writeExampleConfig(cfg: FeimaConfig): string {
     temperature: cfg.temperature,
     contextBudget: cfg.contextBudget,
     keepRecentTurns: cfg.keepRecentTurns,
+    keepTokens: cfg.keepTokens,
     saveSession: cfg.saveSession,
   };
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(sample, null, 2), { mode: 0o600 });
