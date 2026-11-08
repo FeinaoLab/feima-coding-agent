@@ -36,6 +36,7 @@ import {
   type CompactConfig,
 } from "./compact.ts";
 import { DEFAULT_RETRY, withRetry, type RetryPolicy } from "./retry.ts";
+import { RepeatGuard, callSignature } from "./repeat.ts";
 
 const TRUNCATED_NOTE =
   "错误：上一次输出达到长度上限，工具参数可能被截断，本次调用未执行。请缩短参数（例如分次写入或减少改动量）后重新调用。";
@@ -83,6 +84,11 @@ export interface LoopOptions {
   assumeYes?: boolean;
   /** 请求重试策略；不传用默认（3 次，指数退避） */
   retry?: RetryPolicy;
+  /**
+   * 空转检测：模型反复撞同一个坑时先提醒、再中止。
+   * 默认开启；传 false 关闭（只建议在调试提示词时关）。
+   */
+  repeatGuard?: boolean;
   /** 消息流钩子：会话落盘、审计、GUI 历史同步都接这里 */
   onRecord?: (record: LoopRecord) => void;
 }
@@ -100,9 +106,12 @@ export class AgentLoop {
   private lastUsage: Usage | null = null;
   /** --yes 只提示一次，不然每个工具调用都刷一行 */
   private warnedNoGate = false;
+  /** 空转检测；false 时整层不装，连计数都不做 */
+  private repeat: RepeatGuard | null;
 
   constructor(opts: LoopOptions) {
     this.opts = opts;
+    this.repeat = opts.repeatGuard === false ? null : new RepeatGuard();
     this.messages.push({ role: "system", content: opts.systemPrompt });
   }
 
@@ -213,6 +222,8 @@ export class AgentLoop {
     this.busy = true;
     this.state = "chatting";
     this.emitStatus();
+    // 每次提交重置空转计数：新一轮任务重新读同一个文件是正当的
+    this.repeat?.reset();
     this.push({ role: "user", content: input });
 
     let outcome: LoopOutcome = "done";
@@ -346,7 +357,21 @@ export class AgentLoop {
 
       for (const call of calls) {
         const content = await this.runTool(call);
-        this.push({ role: "tool", tool_call_id: call.id, name: call.name, content });
+        // 空转检测挂在「工具刚跑完」这个点上：只有拿着真实结果才能判断
+        // 这次是真推进还是在原地踏步（失败原因相同 = 没换思路）。
+        const verdict =
+          this.repeat?.observe(call.name, callSignature(call.name, call.arguments ?? ""), content) ?? null;
+        this.push({
+          role: "tool",
+          tool_call_id: call.id,
+          name: call.name,
+          content: verdict?.kind === "warn" ? `${content}\n\n${verdict.message}` : content,
+        });
+        if (verdict) {
+          // 用户也得知道：否则界面上只看到模型突然停下或莫名收尾
+          this.emit({ type: "notice", message: verdict.message });
+        }
+        if (verdict?.kind === "stop") return "error";
       }
 
       if (this.steering.length) continue;
@@ -463,11 +488,15 @@ export class AgentLoop {
     const gate = this.opts.confirm;
     if (!gate) {
       if (!this.opts.assumeYes) {
+        // 这句话是给模型看的，不是给人看的。真机验证时模型把「确认策略拦了」
+        // 读成了「文件系统只读」，接着连换四种写法重试，最后建议用户「用管理员身份运行」。
+        // 所以必须显式否认权限问题，并明说重试无用——否则它会一直换姿势撞同一堵墙。
         return {
           ok: false,
           reason:
-            `当前是「${this.opts.confirmMode}」确认模式，但这条通道没有可交互的确认入口，` +
-            `按拒绝处理（要放行请加 --yes）`,
+            `「${this.opts.confirmMode}」确认模式拦下了这次操作：这条通道没有可交互的确认入口，按拒绝处理。` +
+            `这不是文件系统权限问题，是飞码的确认策略；换命令、换写法重试都会被同样拒绝，` +
+            `确实需要放行请让用户加 --yes 重跑。`,
         };
       }
       if (!this.warnedNoGate) {
@@ -481,7 +510,7 @@ export class AgentLoop {
     }
 
     const allowed = await gate({ title, detail });
-    return allowed ? { ok: true } : { ok: false, reason: `用户拒绝执行：${title}` };
+    return allowed ? { ok: true } : { ok: false, reason: `用户拒绝执行：${title}（不要换别的方式重试，先问清楚）` };
   }
 
   private async runTool(call: ToolCall): Promise<string> {

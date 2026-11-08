@@ -168,6 +168,7 @@ test("用户拒绝后工具根本不执行，模型收到的是拒绝原因", as
   assert.equal(await loop.submit("清理一下"), "done");
   assert.equal(tool.calls, 0, "拒绝就是一次都不能跑");
   assert.match(toolMessage(provider), /用户拒绝/);
+  assert.match(toolMessage(provider), /不要换别的方式重试/, "拒绝之后要堵住「换个写法再来一次」");
 });
 
 test("要求确认但没人可问时按拒绝处理，不放行", async () => {
@@ -179,6 +180,11 @@ test("要求确认但没人可问时按拒绝处理，不放行", async () => {
   assert.equal(tool.calls, 0);
   assert.match(toolMessage(provider), /没有可交互的确认入口/);
   assert.match(toolMessage(provider), /--yes/);
+  // 真机验证踩到的坑：模型把「确认策略拦了」读成「文件系统只读」，
+  // 于是一路换写法重试，最后建议用户「用管理员身份运行」。
+  // 拒绝理由必须显式否认权限问题，并明说重试无用。
+  assert.match(toolMessage(provider), /不是文件系统权限问题/);
+  assert.match(toolMessage(provider), /重试都会被同样拒绝/);
 });
 
 test("显式 --yes 才放行，并且提示一次", async () => {

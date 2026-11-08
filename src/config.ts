@@ -39,6 +39,8 @@ export interface FeimaConfig {
   cmdAllow: string[];
   /** 请求重试次数（总尝试次数，含首次）；1 表示不重试 */
   retries: number;
+  /** 空转检测：模型反复撞同一个坑时先提醒再中止；默认开 */
+  repeatGuard: boolean;
   maxTurns: number;
   maxTokens: number;
   temperature: number;
@@ -203,6 +205,10 @@ export function loadConfig(overrides: Partial<FeimaConfig> = {}): FeimaConfig {
     cmdAllow: pickList(overrides.cmdAllow, env.FEIMA_CMD_ALLOW, file.cmdAllow),
     // 总尝试次数含首次：默认 3 次尝试 = 最多重试 2 次
     retries: Math.min(6, Math.max(1, pickNum(3, overrides.retries, env.FEIMA_RETRIES, file.retries))),
+    // 默认开：空转是默认发生的，而「关掉」是明确意图，所以只有显式写 0/false 才关
+    repeatGuard: env.FEIMA_REPEAT
+      ? env.FEIMA_REPEAT !== "0" && env.FEIMA_REPEAT !== "false"
+      : (overrides.repeatGuard ?? file.repeatGuard ?? true) !== false,
     maxTurns: pickNum(40, overrides.maxTurns, env.FEIMA_MAX_TURNS, file.maxTurns),
     maxTokens: pickNum(4096, overrides.maxTokens, env.FEIMA_MAX_TOKENS, file.maxTokens),
     temperature: pickNum(0.2, overrides.temperature, env.FEIMA_TEMPERATURE, file.temperature),
@@ -266,6 +272,7 @@ export function writeExampleConfig(cfg: FeimaConfig): string {
     perms: cfg.perms,
     cmdAllow: cfg.cmdAllow,
     retries: cfg.retries,
+    repeatGuard: cfg.repeatGuard,
     maxTurns: cfg.maxTurns,
     maxTokens: cfg.maxTokens,
     temperature: cfg.temperature,

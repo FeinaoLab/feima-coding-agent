@@ -37,7 +37,7 @@ import { startRpcHost } from "./rpc/host.ts";
 import { parseFlags } from "./cli/flags.ts";
 import type { AgentEvent, ChatMessage } from "./types.ts";
 
-const VERSION = "0.5.0";
+const VERSION = "0.6.0";
 
 interface Runtime {
   config: ReturnType<typeof loadConfig>;
@@ -156,6 +156,7 @@ async function buildRuntime(session: SessionStore | null, opts: RuntimeOpts = {}
     confirmMode: config.confirm,
     assumeYes: config.assumeYes,
     retry: config.retries > 1 ? { ...DEFAULT_RETRY, attempts: config.retries } : NO_RETRY,
+    repeatGuard: config.repeatGuard,
     onRecord: session
       ? (rec) => {
           if (rec.kind === "message") session.appendMessage(rec.message);
@@ -302,6 +303,12 @@ async function doctor(opts: RuntimeOpts = {}): Promise<number> {
     config.retries > 1
       ? `最多 ${config.retries} 次尝试（指数退避；已经吐过内容或执行过工具就不再重试）`
       : "关闭",
+  );
+  console.log(
+    "空转检测   ",
+    config.repeatGuard
+      ? "开（同一失败原因 3 次提醒 / 5 次中止；同一工具连续失败 3 次提醒）"
+      : "关（FEIMA_REPEAT=0；只建议调试提示词时关）",
   );
   if (config.compactModel) {
     const cheap = resolveModel(config, config.compactModel);

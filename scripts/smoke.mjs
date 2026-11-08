@@ -257,6 +257,34 @@ await step("会话持久化：落盘 → 重载 → 消息条数一致", async (
   await sandbox.dispose();
 });
 
+// —— 场景七：空转检测挂进 loop 了吗 ——
+await step("空转检测：同一个失败撞满会提醒并中止", async () => {
+  const rules = parseAllowlist(["echo"]).rules;
+  const sandbox = baseSandbox({ commandAllowlist: rules });
+  // 同一个被拒命令，无限重发：真实白名单拦下的失败 + 真实 loop 的计数
+  const provider = scripted([callTool("bash", { command: "node --version" })]);
+  const events = [];
+  const loop = new AgentLoop({
+    provider,
+    model: "smoke",
+    tools: builtinTools({ policy: defaultPolicy({ workspace }) }),
+    workspace,
+    exec: sandbox.exec,
+    systemPrompt: "冒烟测试",
+    maxTurns: 20,
+  });
+  loop.setEventHandler((e) => events.push(e));
+
+  const outcome = await loop.submit("看下 node 版本");
+  assert(outcome === "error", `撞同一堵墙应该被中止，实际 ${outcome}`);
+  assert(
+    toolResults(provider).some((t) => t.includes("提醒：")),
+    "模型没收到「你在重复」的提醒",
+  );
+  assert(events.some((e) => e.type === "notice"), "用户没收到通知，界面上会像模型莫名收尾");
+  await sandbox.dispose();
+});
+
 // —— 汇总 ——
 const width = (s) => [...s].reduce((n, ch) => n + (ch.codePointAt(0) > 0x2e80 ? 2 : 1), 0);
 const pad = (s, w) => s + " ".repeat(Math.max(1, w - width(s)));

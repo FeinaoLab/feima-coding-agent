@@ -125,6 +125,7 @@ export async function startRpcHost(opts: Partial<FeimaConfig> = {}): Promise<num
     confirmMode: config.confirm,
     assumeYes: config.assumeYes,
     retry: config.retries > 1 ? { ...DEFAULT_RETRY, attempts: config.retries } : NO_RETRY,
+    repeatGuard: config.repeatGuard,
   });
 
   loop.setEventHandler((event) => writeLine({ type: "event", event }));

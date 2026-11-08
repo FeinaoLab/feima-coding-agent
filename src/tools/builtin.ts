@@ -190,6 +190,18 @@ export function builtinTools(opts: BuiltinOptions): Tool[] {
       const abs = resolveRead(policy, rel);
       const depth = Math.min(4, Math.max(1, num(args, "depth", 1)));
       const root = realpathLoose(policy.workspace);
+      // 「目录不存在」不能报成「空目录」：walk 会把 ENOENT 吞掉，
+      // 于是路径写错 / 工作区选错的模型得到的是「这里什么都没有」，
+      // 它会据此判断任务没得做，然后收工。真机端到端就是这么挂的。
+      let stat: fs.Stats;
+      try {
+        stat = fs.statSync(abs);
+      } catch {
+        return { ok: false, content: `目录不存在：${rel}（工作区根目录用 "." 或留空）` };
+      }
+      if (!stat.isDirectory()) {
+        return { ok: false, content: `不是目录：${rel}（读文件用 read_file）` };
+      }
       const out: string[] = [];
       for (const full of walk(abs, depth - 1)) {
         if (!isInside(root, realpathLoose(full))) continue;
