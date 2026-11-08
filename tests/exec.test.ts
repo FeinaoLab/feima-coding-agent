@@ -10,11 +10,23 @@ function ws(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "feima-exec-"));
 }
 
-test("握手：受控命令真实执行并带回 token", async () => {
+test("没有隔离后端时：policy 照常执行，strict 直接拒绝", async () => {
   const dir = ws();
-  const sandbox = createSandbox({ mode: "policy", policy: defaultPolicy({ workspace: dir, home: dir }) });
-  const token = await handshake(sandbox, dir, 15_000);
-  assert.match(token, /^[0-9a-f]{24}$/);
+  const policy = defaultPolicy({ workspace: dir, home: dir });
+
+  const soft = createSandbox({ mode: "policy", policy, isolation: "none" });
+  const report = await handshake(soft);
+  assert.equal(report.ok, false, "没有后端时绝不能谎报隔离生效");
+  assert.match(report.detail, /没有隔离后端/);
+  const r = await soft.exec("echo hi", dir, { timeoutMs: 15_000 });
+  assert.equal(r.stdout.trim(), "hi", "policy 模式本来就允许执行");
+
+  const hard = createSandbox({ mode: "strict", policy, isolation: "none" });
+  await assert.rejects(
+    () => hard.exec("echo hi", dir, { timeoutMs: 15_000 }),
+    /strict 模式下命令执行被拒绝/,
+    "strict 的意思是「没有隔离就不许跑」，不是「降级跑」",
+  );
 });
 
 test("执行器过滤环境变量，子进程看不到密钥", async () => {

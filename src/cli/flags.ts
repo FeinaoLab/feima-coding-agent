@@ -11,8 +11,16 @@ export interface CliFlags {
   noSave: boolean;
   workspace?: string;
   model?: string;
+  sandbox?: "policy" | "strict";
+  isolation?: "auto" | "appcontainer" | "bwrap" | "docker" | "none";
+  network?: boolean;
+  dockerImage?: string;
   rest: string[];
 }
+
+/** 需要取一个值的参数名，单独列出来便于统一做「缺值报错」 */
+const VALUED = ["--workspace", "--model", "--sandbox", "--isolation", "--docker-image"] as const;
+type Valued = (typeof VALUED)[number];
 
 export function parseFlags(rest: string[]): CliFlags {
   const out: CliFlags = { json: false, noSave: false, rest: [] };
@@ -25,12 +33,32 @@ export function parseFlags(rest: string[]): CliFlags {
     }
     if (a === "--json") out.json = true;
     else if (a === "--no-save") out.noSave = true;
-    else if (a === "--workspace" || a === "--model") {
+    else if (a === "--network") out.network = true;
+    else if ((VALUED as readonly string[]).includes(a)) {
       const value = rest[i + 1];
       // 缺值时报错，不静默变成 undefined：否则 `--workspace` 写在末尾就等于没写
       if (!value || value.startsWith("--")) throw new Error(`${a} 需要一个值`);
-      if (a === "--workspace") out.workspace = value;
-      else out.model = value;
+      switch (a as Valued) {
+        case "--workspace":
+          out.workspace = value;
+          break;
+        case "--model":
+          out.model = value;
+          break;
+        case "--sandbox":
+          if (value !== "policy" && value !== "strict") throw new Error("--sandbox 只接受 policy 或 strict");
+          out.sandbox = value;
+          break;
+        case "--isolation":
+          if (!["auto", "appcontainer", "bwrap", "docker", "none"].includes(value)) {
+            throw new Error("--isolation 只接受 auto / appcontainer / bwrap / docker / none");
+          }
+          out.isolation = value as CliFlags["isolation"];
+          break;
+        case "--docker-image":
+          out.dockerImage = value;
+          break;
+      }
       i++;
     } else out.rest.push(a);
   }

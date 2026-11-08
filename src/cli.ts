@@ -15,7 +15,7 @@
 import readline from "node:readline";
 import process from "node:process";
 import path from "node:path";
-import { loadConfig, writeExampleConfig, CONFIG_FILE } from "./config.ts";
+import { loadConfig, writeExampleConfig, CONFIG_FILE, type FeimaConfig } from "./config.ts";
 import { buildSystemPrompt } from "./prompt.ts";
 import { AgentLoop } from "./core/loop.ts";
 import { SessionStore, defaultSessionDir } from "./core/session.ts";
@@ -23,12 +23,13 @@ import { estimateMessages } from "./core/compact.ts";
 import { createOpenAIProvider } from "./providers/openai.ts";
 import { builtinTools } from "./tools/builtin.ts";
 import { assertWorkspace, defaultPolicy, redact } from "./safety/policy.ts";
-import { createSandbox, handshake, describePlatform } from "./safety/exec.ts";
+import { createSandbox, handshake, describePlatform, probeIsolation } from "./safety/exec.ts";
+import { grantAncestors } from "./safety/backends/appcontainer.ts";
 import { startRpcHost } from "./rpc/host.ts";
 import { parseFlags } from "./cli/flags.ts";
 import type { AgentEvent, ChatMessage } from "./types.ts";
 
-const VERSION = "0.2.1";
+const VERSION = "0.3.0";
 
 interface Runtime {
   config: ReturnType<typeof loadConfig>;
@@ -37,17 +38,27 @@ interface Runtime {
   session: SessionStore | null;
 }
 
-interface RuntimeOpts {
-  workspace?: string;
-  model?: string;
-}
+// 运行时覆盖沿用整套配置类型：新增开关（沙盒、隔离后端、网络）不必再改签名
+type RuntimeOpts = Partial<FeimaConfig>;
 
 async function buildRuntime(session: SessionStore | null, opts: RuntimeOpts = {}): Promise<Runtime> {
-  const config = loadConfig({ workspace: opts.workspace, model: opts.model });
+  const config = loadConfig(opts);
   const ws = assertWorkspace(config.workspace);
   const policy = defaultPolicy({ workspace: ws });
-  const sandbox = createSandbox({ mode: config.sandbox, policy });
-  await handshake(sandbox, ws);
+  const sandbox = createSandbox({
+    mode: config.sandbox,
+    policy,
+    isolation: config.isolation,
+    network: config.network,
+    dockerImage: config.dockerImage,
+  });
+  await sandbox.init();
+  const verify = await handshake(sandbox);
+  if (config.sandbox === "strict" && !verify.ok) {
+    throw new Error(`隔离自检未通过：${verify.detail}`);
+  }
+  // 退出时撤销 AppContainer 的目录授权：留着 ACL 就是安全债
+  process.once("exit", () => void sandbox.dispose());
 
   const tools = builtinTools({ policy });
   const provider = createOpenAIProvider({ baseUrl: config.baseUrl, apiKey: config.apiKey });
@@ -112,12 +123,34 @@ async function doctor(): Promise<number> {
     console.log("denyRead   ", policy.denyRead.length, "项");
     console.log("denyWrite  ", policy.denyWrite.length, "项");
 
-    const sandbox = createSandbox({ mode: config.sandbox, policy });
-    const token = await handshake(sandbox, ws);
-    console.log("执行握手   ", `通过（token ${token.slice(0, 6)}…）`);
-    console.log("隔离能力   ", sandbox.isolated ? "已启用" : "未启用（进程级隔离后端未安装）");
-    if (config.sandbox === "strict" && !sandbox.isolated) {
-      console.log("结论       ", "strict 模式下命令执行会被拒绝，请改回 policy 或安装隔离后端");
+    for (const probe of probeIsolation({ network: config.network, dockerImage: config.dockerImage })) {
+      console.log(`后端 ${probe.id.padEnd(13)}`, probe.availability.available
+        ? `可用（${probe.availability.reason}）`
+        : `不可用（${probe.availability.reason}）`);
+    }
+
+    const sandbox = createSandbox({
+      mode: config.sandbox,
+      policy,
+      isolation: config.isolation,
+      network: config.network,
+      dockerImage: config.dockerImage,
+    });
+    console.log("隔离后端   ", sandbox.describe());
+    console.log("选择理由   ", sandbox.rationale);
+    await sandbox.init();
+
+    const verify = await handshake(sandbox);
+    if (!sandbox.isolated) {
+      console.log("隔离自检   ", "跳过（当前没有任何隔离后端，策略层仍然生效）");
+    } else {
+      console.log("隔离自检   ", verify.ok ? "通过" : "未通过");
+      console.log("  明细     ", verify.detail);
+    }
+    await sandbox.dispose();
+
+    if (config.sandbox === "strict" && !verify.ok) {
+      console.log("结论       ", "strict 模式下命令执行会被拒绝，请查看上面的探测原因");
       ok = false;
     }
   } catch (err) {
@@ -224,8 +257,7 @@ function printResumeBanner(loop: AgentLoop, session: SessionStore, loaded: Retur
 async function interactive(
   opts: { session?: SessionStore | null; resume?: boolean } & RuntimeOpts = {},
 ): Promise<number> {
-  const session =
-    opts.session === undefined ? newSession(loadConfig({ workspace: opts.workspace, model: opts.model })) : opts.session;
+  const session = opts.session === undefined ? newSession(loadConfig(opts)) : opts.session;
   const rt = await buildRuntime(session, opts);
   const cfg = rt.config;
 
@@ -409,7 +441,7 @@ function printSessionTable(list: ReturnType<typeof SessionStore.list>): void {
 }
 
 async function resumeSession(id: string, opts: RuntimeOpts = {}): Promise<number> {
-  const cfg = loadConfig({ workspace: opts.workspace, model: opts.model });
+  const cfg = loadConfig(opts);
   let store: SessionStore;
   try {
     store = SessionStore.open(id);
@@ -463,16 +495,50 @@ function usage(): void {
 选项：
   --workspace <dir>           指定工作区，默认当前目录
   --model <name>              覆盖模型
-  --sandbox <policy|strict>   沙盒模式，strict 下命令执行需隔离后端
+  --sandbox <policy|strict>   沙盒模式：strict 必须有真隔离后端，否则拒绝执行命令
+  --isolation <backend>       指定隔离后端：auto|appcontainer|bwrap|docker|none
+  --network                   允许沙盒内出网（默认关闭）
+  --docker-image <name>       docker 后端使用的镜像（默认 node:22-alpine）
   --no-save                   不写会话文件
   --json                      事件流输出
 
+沙盒：
+  feima sandbox grant [dir]   给 Windows AppContainer 授权工作区的上级目录（通常需管理员）
+
 环境变量：
   FEIMA_API_KEY / FEIMA_BASE_URL / FEIMA_MODEL / FEIMA_WORKSPACE / FEIMA_SANDBOX
+  FEIMA_ISOLATION（默认 auto）/ FEIMA_NETWORK=1（允许出网）/ FEIMA_DOCKER_IMAGE
   FEIMA_CONTEXT_BUDGET（默认 22000）/ FEIMA_KEEP_TURNS（默认 3）
   FEIMA_KEEP_TOKENS（单轮长工具链保留的尾部 token，默认取预算一半）/ FEIMA_NO_SAVE
   FEIMA_HOME（覆盖 ~/.feima）
 `);
+}
+
+/**
+ * `feima sandbox grant [dir]`
+ *
+ * AppContainer 要进入工作区，得先能穿过每一级上级目录；这些目录默认没有
+ * 给容器的 ACE，而改它们往往需要管理员权限。这一步慢、要提权、会改系统状态，
+ * 所以做成显式命令，不在启动路径里偷偷做。
+ */
+async function sandboxCommand(args: string[], opts: RuntimeOpts): Promise<number> {
+  if (args[0] !== "grant") {
+    console.error("用法：feima sandbox grant [dir]");
+    return 2;
+  }
+  if (process.platform !== "win32") {
+    console.error("sandbox grant 只对 Windows 的 AppContainer 后端有意义；Linux/macOS 用 bwrap / docker 不需要授权目录");
+    return 2;
+  }
+  const target = assertWorkspace(args[1] ?? loadConfig(opts).workspace);
+  const res = grantAncestors(target);
+  for (const line of res.log) console.log(line);
+  if (res.ok) {
+    console.log("\n完成：AppContainer 现在可以进入这个工作区。用 FEIMA_SANDBOX=strict feima doctor 复验。");
+    return 0;
+  }
+  console.log("\n有失败项。这些目录通常需要管理员权限，请用管理员终端重新执行本条命令。");
+  return 1;
 }
 
 async function main(argv: string[]): Promise<number> {
@@ -481,7 +547,17 @@ async function main(argv: string[]): Promise<number> {
 
   const cmd = args[0];
   const flags = parseFlags(args.slice(1));
-  const saveOverride: Partial<{ saveSession: boolean }> = flags.noSave ? { saveSession: false } : {};
+  // 一份覆盖对象贯穿到底：沙盒模式与隔离后端同样要走命令行优先级，
+  // 否则 `--sandbox strict` 只是被解析出来、并没有生效（v0.2.1 踩过的坑）
+  const cfgOverride: RuntimeOpts = {
+    ...(flags.noSave ? { saveSession: false } : {}),
+    ...(flags.workspace ? { workspace: flags.workspace } : {}),
+    ...(flags.model ? { model: flags.model } : {}),
+    ...(flags.sandbox ? { sandbox: flags.sandbox } : {}),
+    ...(flags.isolation ? { isolation: flags.isolation } : {}),
+    ...(flags.network ? { network: true } : {}),
+    ...(flags.dockerImage ? { dockerImage: flags.dockerImage } : {}),
+  };
 
   if (cmd === "--help" || cmd === "-h" || cmd === "help") {
     usage();
@@ -497,10 +573,10 @@ async function main(argv: string[]): Promise<number> {
     return 0;
   }
   if (cmd === "doctor") return doctor();
-  if (cmd === "rpc") return startRpcHost({ workspace: flags.workspace, model: flags.model });
+  if (cmd === "rpc") return startRpcHost(cfgOverride);
   if (cmd === "sessions") return sessionsCommand(flags.rest, flags.json);
-  if (cmd === "resume")
-    return resumeSession(flags.rest[0] ?? "last", { workspace: flags.workspace, model: flags.model });
+  if (cmd === "sandbox") return sandboxCommand(flags.rest, cfgOverride);
+  if (cmd === "resume") return resumeSession(flags.rest[0] ?? "last", cfgOverride);
   if (cmd === "run") {
     const task = flags.rest.join(" ").trim();
     if (!task) {
@@ -508,13 +584,13 @@ async function main(argv: string[]): Promise<number> {
       return 2;
     }
     // 会话的 meta.workspace 必须与 --workspace 一致，否则列表里记的是另一个目录
-    const cfg = loadConfig({ ...saveOverride, workspace: flags.workspace, model: flags.model });
-    return runOnce(task, flags.json, newSession(cfg), { workspace: cfg.workspace, model: cfg.model });
+    const cfg = loadConfig(cfgOverride);
+    return runOnce(task, flags.json, newSession(cfg), { ...cfgOverride, workspace: cfg.workspace });
   }
 
   // 兜底：按一次性任务处理，方便 feima "直接说需求"
-  const cfg = loadConfig({ ...saveOverride, workspace: flags.workspace, model: flags.model });
-  return runOnce(flags.rest.join(" "), false, newSession(cfg), { workspace: cfg.workspace, model: cfg.model });
+  const cfg = loadConfig(cfgOverride);
+  return runOnce(flags.rest.join(" "), false, newSession(cfg), { ...cfgOverride, workspace: cfg.workspace });
 }
 
 main(process.argv)

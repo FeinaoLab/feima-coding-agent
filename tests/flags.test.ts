@@ -35,3 +35,23 @@ test("没有参数时全部落到 rest", () => {
   assert.equal(f.workspace, undefined);
   assert.deepEqual(f.rest, ["读 README 并总结"]);
 });
+
+test("沙盒与隔离相关参数能被解析出来", () => {
+  const f = parseFlags(["--sandbox", "strict", "--isolation", "docker", "--network", "--docker-image", "node:20", "干活"]);
+  assert.equal(f.sandbox, "strict");
+  assert.equal(f.isolation, "docker");
+  assert.equal(f.network, true);
+  assert.equal(f.dockerImage, "node:20");
+  assert.deepEqual(f.rest, ["干活"]);
+});
+
+test("非法沙盒模式与后端名直接报错，不留到运行时", () => {
+  assert.throws(() => parseFlags(["--sandbox", "loose"]), /policy|strict/);
+  assert.throws(() => parseFlags(["--isolation", "firejail"]), /appcontainer|bwrap/);
+});
+
+test("新参数缺值时同样报错，不静默变成 undefined", () => {
+  for (const flag of ["--sandbox", "--isolation", "--docker-image"]) {
+    assert.throws(() => parseFlags([flag]), /需要一个值/, `${flag} 缺值应当报错`);
+  }
+});

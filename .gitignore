@@ -8,3 +8,6 @@ coverage/
 .env
 .env.*
 !.env.example
+
+# 隔离后端在工作区里落临时输出（AppContainer 只能写被授权的目录）
+.feima-tmp/

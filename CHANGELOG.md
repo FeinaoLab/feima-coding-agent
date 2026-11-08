@@ -1,5 +1,31 @@
 # CHANGELOG
 
+## v0.3.0 — 2026-11-08
+
+`strict` 从"空壳"变成"真的能隔离"。三平台各给一个后端，可用性靠探针判定而不是靠"装没装"。
+
+### 新增
+
+- **隔离后端契约**（`src/safety/isolation.ts`）：`availability / prepare / plan / selfTest / dispose`。执行层只问一句"这条命令交给谁 spawn"，平台差异全在各自后端里。
+- **`appcontainer` 后端**（Windows 原生）：按工作区路径哈希注册独立 profile，只把该 SID 授权到工作区，用该 SID 的令牌启动子进程。读不到 `%USERPROFILE%`，写不出去，不靠命令过滤。
+- **`bwrap` 后端**（Linux）：mount namespace 白名单，只绑定明确列出的系统目录，工作区是唯一可写路径，`--unshare-all` 默认断网。
+- **`docker` 后端**（Linux/macOS）：同路径挂载 + `--cap-drop ALL` + `no-new-privileges`，默认 `--network none`。
+- **真实自检**：宿主家目录放诱饵 → 沙盒内读必须失败；工作区读、写、列目录必须成功。五项全过才算"隔离可用"。
+- **`feima sandbox grant [dir]`**：给工作区的上级目录授权遍历（AppContainer 的硬要求，通常需管理员）。
+- CLI 新增 `--sandbox` / `--isolation` / `--network` / `--docker-image`，对应 `FEIMA_ISOLATION` / `FEIMA_NETWORK` / `FEIMA_DOCKER_IMAGE`。
+- `doctor` 逐项列出每个后端的探测结果与不可用原因，并跑一次真自检。
+
+### 修复
+
+- **`--sandbox` 文档里有、解析里没有**：写进 `usage()` 但从没进 `parseFlags`，`feima run --sandbox strict "…"` 会把参数当成任务文本的一部分。这是 v0.2.1 那类"解析出来没人用"的复发，这次是根本没解析。
+- **环境变量名大小写**：基础环境里的 `Path` 与后端补的 `PATH` 并存时，spawn 会传出两个条目，系统取哪个看运气。
+- **MSYS/Git Bash 启动时 PATH 不含 System32**：容器里连 `cmd.exe` 都找不到。
+
+### 测试
+
+64 例（策略 7 / 循环 12 / 执行 4 / 压缩 13 / 会话 9 / 长任务 3 / 参数 8 / 隔离 8），全部离线。
+
+
 ## v0.2.1 — 2026-11-08
 
 补做 v0.2.0 验收清单的最后一项（长任务连续性），做的时候用例直接挂了：25 轮工具调用，压缩一次都没触发。不是「压得不够勤」，是「完全不压」。

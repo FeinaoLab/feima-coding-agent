@@ -7,7 +7,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { SandboxMode } from "../safety/exec.ts";
+import type { IsolationChoice, SandboxMode } from "../safety/exec.ts";
 
 export interface FeimaConfig {
   baseUrl: string;
@@ -15,6 +15,12 @@ export interface FeimaConfig {
   model: string;
   workspace: string;
   sandbox: SandboxMode;
+  /** 进程级隔离后端：auto / appcontainer / bwrap / docker / none */
+  isolation: IsolationChoice;
+  /** 沙盒内是否允许出网 */
+  network: boolean;
+  /** docker 后端使用的镜像 */
+  dockerImage: string;
   maxTurns: number;
   maxTokens: number;
   temperature: number;
@@ -66,6 +72,18 @@ export function loadConfig(overrides: Partial<FeimaConfig> = {}): FeimaConfig {
     env.FEIMA_SANDBOX,
     typeof file.sandbox === "string" ? file.sandbox : "",
   );
+  const isolationRaw = pickStr(
+    String(overrides.isolation ?? ""),
+    env.FEIMA_ISOLATION,
+    typeof file.isolation === "string" ? file.isolation : "",
+    "auto",
+  ).toLowerCase();
+  const isolation: IsolationChoice =
+    isolationRaw === "appcontainer" || isolationRaw === "bwrap" || isolationRaw === "docker" || isolationRaw === "none"
+      ? isolationRaw
+      : "auto";
+  // 网络默认关：Agent 大多数任务不需要出网，关掉能顺手把"数据外带"这条路一起堵上
+  const networkRaw = pickStr(String(overrides.network ?? ""), env.FEIMA_NETWORK, String(file.network ?? "")).toLowerCase();
 
   return {
     baseUrl: pickStr(
@@ -96,6 +114,14 @@ export function loadConfig(overrides: Partial<FeimaConfig> = {}): FeimaConfig {
       ),
     ),
     sandbox: sandboxRaw === "strict" ? "strict" : "policy",
+    isolation,
+    network: networkRaw === "1" || networkRaw === "true" || networkRaw === "yes",
+    dockerImage: pickStr(
+      overrides.dockerImage,
+      env.FEIMA_DOCKER_IMAGE,
+      typeof file.dockerImage === "string" ? file.dockerImage : "",
+      "node:22-alpine",
+    ),
     maxTurns: pickNum(40, overrides.maxTurns, env.FEIMA_MAX_TURNS, file.maxTurns),
     maxTokens: pickNum(4096, overrides.maxTokens, env.FEIMA_MAX_TOKENS, file.maxTokens),
     temperature: pickNum(0.2, overrides.temperature, env.FEIMA_TEMPERATURE, file.temperature),
@@ -117,6 +143,9 @@ export function writeExampleConfig(cfg: FeimaConfig): string {
     model: cfg.model,
     workspace: cfg.workspace,
     sandbox: cfg.sandbox,
+    isolation: cfg.isolation,
+    network: cfg.network,
+    dockerImage: cfg.dockerImage,
     maxTurns: cfg.maxTurns,
     maxTokens: cfg.maxTokens,
     temperature: cfg.temperature,

@@ -38,10 +38,18 @@ export async function startRpcHost(opts: { workspace?: string; model?: string } 
   const config = loadConfig({ workspace: opts.workspace, model: opts.model });
   const workspace = assertWorkspace(config.workspace);
   const policy = defaultPolicy({ workspace });
-  const sandbox = createSandbox({ mode: config.sandbox, policy });
+  const sandbox = createSandbox({
+    mode: config.sandbox,
+    policy,
+    isolation: config.isolation,
+    network: config.network,
+    dockerImage: config.dockerImage,
+  });
 
   try {
-    await handshake(sandbox, workspace);
+    await sandbox.init();
+    // 验证不通过就退出：桌面端不能带着"以为隔离了"的状态接受命令
+    await handshake(sandbox);
   } catch (err) {
     // 握手失败必须上报并退出，不能带着“假绿”继续接受命令
     writeLine({ type: "fatal", message: redact(err instanceof Error ? err.message : String(err)) });

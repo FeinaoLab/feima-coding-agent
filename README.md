@@ -58,7 +58,7 @@ FEIMA_BASE_URL=http://localhost:11434/v1 FEIMA_API_KEY=ollama FEIMA_MODEL=qwen3:
 | `feima resume [id\|last]` | 恢复会话，把历史带回来继续 |
 | `feima sessions` | 列出会话（`--json` 可解析，`rm <id>` 删除） |
 | `feima rpc` | 常驻进程，stdin/stdout 收发 JSON 行，供桌面端驱动 |
-| `feima doctor` | 体检：配置、策略、沙盒握手、隔离能力、会话目录、上下文预算 |
+| `feima doctor` | 体检：配置、策略、各隔离后端探测 + 真自检、会话目录、上下文预算 |
 | `feima init` | 生成 `~/.feima/config.json` 模板 |
 
 交互模式里的斜杠命令：
@@ -126,7 +126,7 @@ FEIMA_BASE_URL=http://localhost:11434/v1 FEIMA_API_KEY=ollama FEIMA_MODEL=qwen3:
 
 ## 安全模型
 
-当前实现的是**策略层**隔离，进程级隔离（沙盒/容器）留了后端接口，尚未安装。
+两层：**策略层**永远生效，**隔离层**按需启用。
 
 | 机制 | 做了什么 |
 | --- | --- |
@@ -134,11 +134,29 @@ FEIMA_BASE_URL=http://localhost:11434/v1 FEIMA_API_KEY=ollama FEIMA_MODEL=qwen3:
 | 写入黑名单 | `.git/hooks`、`.git/config`、`node_modules`、`.agents`、`.codex` |
 | 环境变量白名单 | 子进程只拿到 16 类变量，API Key 一律不传 |
 | 命令策略 | 拦 `rm -rf /`、强推、`curl \| sh` 等破坏性指令 |
-| 失败即阻断 | 握手不通过就拒绝执行，不静默降级 |
+| 失败即阻断 | 自检不通过就拒绝执行，不静默降级 |
 | 错误脱敏 | `sk-…`、`Bearer …`、`ghp_…` 在展示/落日志前统一抹掉 |
 | 超时与进程组 | 命令超时按进程树杀掉，不留孤儿 |
 
-`--sandbox strict` 表示"没有真实隔离就不许执行命令"，需要接入隔离后端才可用；`policy`（默认）表示策略检查生效、但进程本身没有沙箱。
+### 隔离后端（v0.3）
+
+`--sandbox strict` 的含义是「没有真隔离就不许执行命令」。真隔离由后端提供：
+
+| 后端 | 平台 | 做法 | 前提 |
+| --- | --- | --- | --- |
+| `appcontainer` | Windows | 按工作区注册独立 AppContainer profile，用该 SID 的令牌启动子进程 | 无需 daemon；首次可能需 `feima sandbox grant` 授权上级目录 |
+| `bwrap` | Linux | mount namespace 白名单，工作区唯一可写，`--unshare-all` 断网 | `apt install bubblewrap` |
+| `docker` | Linux / macOS | 同路径挂载 + `--cap-drop ALL` + `--network none` | docker daemon |
+
+```bash
+FEIMA_SANDBOX=strict feima doctor          # 探测 + 真自检
+FEIMA_SANDBOX=strict feima run "..."       # 自检不过就拒绝启动
+feima sandbox grant                        # Windows：给上级目录授权（通常需管理员）
+```
+
+默认网络关闭（`FEIMA_NETWORK=1` 或 `--network` 才放行）。命令输出在 `files` 模式下走工作区里的 `.feima-tmp/`，由后端决定，对工具层透明。
+
+**自检是五件事，不是四件**：读工作区诱饵、读宿主家目录诱饵被拒、写工作区、写宿主家目录被拒、**列目录必须成功**。最后一项是踩出来的——前四项全绿、`dir` 全被拒，因为前四项用的是已建立的 cwd 句柄，绕过了路径解析。
 
 ## 架构
 
@@ -150,7 +168,7 @@ CLI / RPC / (未来的 GUI)
         ├── Session（JSONL append-only，随消息流同步落盘）
         ├── Provider（OpenAI 兼容，SSE 自己切 \n）
         ├── Tools（7 个内置）
-        └── Sandbox（策略 + 执行器，预留隔离后端）
+        └── Sandbox（策略层 + 隔离后端：appcontainer / bwrap / docker）
 ```
 
 细节见 `docs/01-架构.md`，演进过程见 `EVOLUTION.md`，取舍理由见 `docs/03-决策记录.md`。
@@ -191,8 +209,9 @@ npm run typecheck # 需要另装 typescript（可选，开发期依赖）
 
 v0.1：核心循环、工具、策略层安全、CLI、RPC。
 v0.2：上下文压缩、会话持久化。
-v0.2.1（当前）：长任务验收补做，修掉「单轮长工具链不压缩」「空输出截断判完成」「`--workspace` 失效」。
-v0.3：重试策略、工具确认、多模型配置、真实隔离后端。
+v0.2.1：长任务验收补做，修掉「单轮长工具链不压缩」「空输出截断判完成」「`--workspace` 失效」。
+v0.3（当前）：隔离后端——AppContainer / bubblewrap / docker，真探针式自检。
+v0.4：重试策略、工具确认、多模型配置。
 v1.0：Electron 桌面端，复用 `feima rpc`，不重写引擎。
 
 详见 `docs/02-路线图.md`。
