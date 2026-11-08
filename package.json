@@ -1,6 +1,6 @@
 {
   "name": "feima-coding-agent",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "飞码 CodingAgent — 中文优先的终端编程 Agent，零运行时依赖",
   "type": "module",
   "bin": {

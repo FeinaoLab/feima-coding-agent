@@ -17,6 +17,7 @@ import type {
   AgentState,
   ChatMessage,
   ExecFn,
+  LoopRecord,
   Provider,
   Tool,
   ToolCall,
@@ -26,6 +27,12 @@ import type {
 import { PolicyError, redact } from "../safety/policy.ts";
 import { ToolCallAssembler } from "../providers/openai.ts";
 import { preview } from "../tools/builtin.ts";
+import {
+  compactIfNeeded,
+  estimateMessages,
+  makeSummarizer,
+  type CompactConfig,
+} from "./compact.ts";
 
 const TRUNCATED_NOTE =
   "错误：上一次输出达到长度上限，工具参数可能被截断，本次调用未执行。请缩短参数（例如分次写入或减少改动量）后重新调用。";
@@ -43,6 +50,10 @@ export interface LoopOptions {
   maxTokens?: number;
   temperature?: number;
   onEvent?: (event: AgentEvent) => void;
+  /** 上下文压缩策略；不传则永不压缩 */
+  compaction?: CompactConfig;
+  /** 消息流钩子：会话落盘、审计、GUI 历史同步都接这里 */
+  onRecord?: (record: LoopRecord) => void;
 }
 
 export class AgentLoop {
@@ -53,6 +64,7 @@ export class AgentLoop {
   private steering: string[] = [];
   private followUps: string[] = [];
   private turns = 0;
+  private compactions = 0;
   private controller: AbortController | null = null;
   private lastUsage: Usage | null = null;
 
@@ -65,11 +77,6 @@ export class AgentLoop {
     this.opts.onEvent?.(event);
   }
 
-  /** 替换事件处理器（CLI / RPC / GUI 各自接自己的出口） */
-  setEventHandler(fn: (event: AgentEvent) => void): void {
-    this.opts.onEvent = fn;
-  }
-
   private emitStatus(): void {
     this.emit({
       type: "status",
@@ -77,6 +84,20 @@ export class AgentLoop {
       pendingFeedback: this.steering.length,
       queued: this.followUps.length,
     });
+  }
+
+  /**
+   * 所有消息写入的统一出口。
+   * 直接 push 数组会漏掉落盘——历史里少一条，恢复出来的会话就是断的。
+   */
+  private push(message: ChatMessage): void {
+    this.messages.push(message);
+    this.opts.onRecord?.({ kind: "message", message });
+  }
+
+  /** 替换事件处理器（CLI / RPC / GUI 各自接自己的出口） */
+  setEventHandler(fn: (event: AgentEvent) => void): void {
+    this.opts.onEvent = fn;
   }
 
   getSnapshot(): AgentSnapshot {
@@ -88,6 +109,8 @@ export class AgentLoop {
       queued: this.followUps.length,
       turns: this.turns,
       messages: this.messages.length,
+      contextTokens: estimateMessages(this.messages),
+      compactions: this.compactions,
     };
   }
 
@@ -120,7 +143,21 @@ export class AgentLoop {
     this.steering = [];
     this.followUps = [];
     this.turns = 0;
+    this.compactions = 0;
+    this.opts.onRecord?.({ kind: "reset" });
     this.emitStatus();
+  }
+
+  /**
+   * 从持久化历史恢复。
+   * 系统提示用当前配置重新生成：恢复旧会话时系统提示可能已经改过（比如工作区变了），
+   * 继续用旧的等于把过期约束带回来。
+   */
+  restore(messages: ChatMessage[]): number {
+    const body = messages.filter((m, i) => !(i === 0 && m.role === "system"));
+    this.messages = [{ role: "system", content: this.opts.systemPrompt }, ...body];
+    this.emitStatus();
+    return body.length;
   }
 
   async submit(input: string): Promise<LoopOutcome> {
@@ -134,7 +171,7 @@ export class AgentLoop {
     this.busy = true;
     this.state = "chatting";
     this.emitStatus();
-    this.messages.push({ role: "user", content: input });
+    this.push({ role: "user", content: input });
 
     let outcome: LoopOutcome = "done";
     try {
@@ -157,7 +194,7 @@ export class AgentLoop {
 
       const next = this.followUps.shift();
       if (!next) return "done";
-      this.messages.push({ role: "user", content: next });
+      this.push({ role: "user", content: next });
       this.emitStatus();
     }
   }
@@ -165,8 +202,46 @@ export class AgentLoop {
   private drainSteering(): void {
     while (this.steering.length) {
       const text = this.steering.shift();
-      if (text) this.messages.push({ role: "user", content: text });
+      if (text) this.push({ role: "user", content: text });
     }
+  }
+
+  /**
+   * 每轮请求前检查上下文。
+   * 放在 drainSteering 之后：刚插进来的指令必须留在保留区里，
+   * 否则会出现「用户刚说的事被摘要吃掉」这种最让人恼火的情况。
+   */
+  private async maybeCompact(force = false): Promise<void> {
+    if (!this.opts.compaction) return;
+
+    const base = this.opts.compaction;
+    const result = await compactIfNeeded(this.messages, {
+      // 手动 /compact 时把预算压到 0，让「有内容就折」成立
+      ...base,
+      budget: force ? 0 : base.budget,
+      summarize: base.summarize ?? makeSummarizer(this.opts.provider, this.opts.model),
+    });
+    if (!result.compacted) return;
+
+    this.messages = result.messages;
+    this.compactions++;
+    this.emit({
+      type: "compact",
+      before: result.before,
+      after: result.after,
+      folded: result.folded,
+    });
+    this.opts.onRecord?.({
+      kind: "compact",
+      before: result.before,
+      after: result.after,
+      folded: result.folded,
+    });
+  }
+
+  /** 手动压缩：交互里 /compact 用 */
+  async compactNow(): Promise<void> {
+    await this.maybeCompact(true);
   }
 
   private async inner(): Promise<LoopOutcome> {
@@ -177,6 +252,7 @@ export class AgentLoop {
       rounds++;
       this.turns++;
       this.drainSteering();
+      await this.maybeCompact();
 
       const res = await this.streamOnce();
       if (res.kind === "aborted") {
@@ -188,7 +264,7 @@ export class AgentLoop {
         return "error";
       }
 
-      this.messages.push(res.message);
+      this.push(res.message);
       const calls = res.message.tool_calls ?? [];
 
       if (!calls.length) {
@@ -200,7 +276,7 @@ export class AgentLoop {
       if (res.finish === "length") {
         // 参数可能被截断，执行会得到半截命令，宁可让模型重发
         for (const call of calls) {
-          this.messages.push({
+          this.push({
             role: "tool",
             tool_call_id: call.id,
             name: call.name,
@@ -212,7 +288,7 @@ export class AgentLoop {
 
       for (const call of calls) {
         const content = await this.runTool(call);
-        this.messages.push({ role: "tool", tool_call_id: call.id, name: call.name, content });
+        this.push({ role: "tool", tool_call_id: call.id, name: call.name, content });
       }
 
       if (this.steering.length) continue;

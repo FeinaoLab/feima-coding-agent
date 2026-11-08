@@ -58,6 +58,8 @@ export async function startRpcHost(opts: { workspace?: string } = {}): Promise<n
     maxTurns: config.maxTurns,
     maxTokens: config.maxTokens,
     temperature: config.temperature,
+    // 桌面端会话往往更长，压缩必须和 CLI 一致，否则同一段历史两边表现不同
+    compaction: { budget: config.contextBudget, keepRecentTurns: config.keepRecentTurns },
   });
 
   loop.setEventHandler((event) => writeLine({ type: "event", event }));

@@ -19,6 +19,12 @@ export interface FeimaConfig {
   maxTokens: number;
   temperature: number;
   systemExtra: string;
+  /** 上下文估算 token 上限，超过即折叠中段历史 */
+  contextBudget: number;
+  /** 压缩时保留最近多少个用户轮次 */
+  keepRecentTurns: number;
+  /** 是否把会话写入 ~/.feima/sessions */
+  saveSession: boolean;
 }
 
 export const CONFIG_DIR = path.join(os.homedir(), ".feima");
@@ -92,6 +98,9 @@ export function loadConfig(overrides: Partial<FeimaConfig> = {}): FeimaConfig {
     maxTokens: pickNum(4096, overrides.maxTokens, env.FEIMA_MAX_TOKENS, file.maxTokens),
     temperature: pickNum(0.2, overrides.temperature, env.FEIMA_TEMPERATURE, file.temperature),
     systemExtra: pickStr(overrides.systemExtra, env.FEIMA_SYSTEM_EXTRA, typeof file.systemExtra === "string" ? file.systemExtra : ""),
+    contextBudget: pickNum(22000, overrides.contextBudget, env.FEIMA_CONTEXT_BUDGET, file.contextBudget),
+    keepRecentTurns: Math.max(1, pickNum(3, overrides.keepRecentTurns, env.FEIMA_KEEP_TURNS, file.keepRecentTurns)),
+    saveSession: env.FEIMA_NO_SAVE ? false : (overrides.saveSession ?? file.saveSession ?? true) !== false,
   };
 }
 
@@ -108,6 +117,9 @@ export function writeExampleConfig(cfg: FeimaConfig): string {
     maxTurns: cfg.maxTurns,
     maxTokens: cfg.maxTokens,
     temperature: cfg.temperature,
+    contextBudget: cfg.contextBudget,
+    keepRecentTurns: cfg.keepRecentTurns,
+    saveSession: cfg.saveSession,
   };
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(sample, null, 2), { mode: 0o600 });
   return CONFIG_FILE;

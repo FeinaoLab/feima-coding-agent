@@ -71,6 +71,8 @@ export type AgentEvent =
   | { type: "tool_start"; id: string; name: string; args: string }
   | { type: "tool_end"; id: string; name: string; ok: boolean; preview: string }
   | { type: "usage"; usage: Usage }
+  /** 上下文被折叠：before/after 是估算 token，folded 是被折叠的消息条数 */
+  | { type: "compact"; before: number; after: number; folded: number }
   | { type: "turn_end"; turn: number }
   | { type: "agent_settled" }
   | { type: "error"; message: string; retryable: boolean }
@@ -85,7 +87,16 @@ export interface AgentSnapshot {
   queued: number;
   turns: number;
   messages: number;
+  /** 上下文估算 token 与压缩次数，便于判断何时该开新会话 */
+  contextTokens: number;
+  compactions: number;
 }
+
+/** 消息流记录：会话落盘与 UI 订阅共用同一条通路，避免两边各写一遍导致不一致 */
+export type LoopRecord =
+  | { kind: "message"; message: ChatMessage }
+  | { kind: "compact"; before: number; after: number; folded: number }
+  | { kind: "reset" };
 
 export interface ProviderEvent {
   text?: string;

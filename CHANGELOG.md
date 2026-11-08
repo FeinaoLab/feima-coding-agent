@@ -1,5 +1,48 @@
 # CHANGELOG
 
+## v0.2.0 — 2026-11-08
+
+主题是「让长会话能持续用」：上下文不再顶到模型上限，中断后不用重来。范围刻意压窄，只做压缩与持久化。
+
+### 新增
+
+- **上下文压缩**：估算 token 超过 `contextBudget`（默认 22000）时，把中段历史折叠成一条摘要消息；最近 `keepRecentTurns`（默认 3）轮原样保留。
+  - 系统提示永不折叠；切分点只落在 `user` 消息，`assistant(tool_calls)` 与 `tool` 结果永远成对；
+  - 压缩后若未变小则放弃；摘要失败降级为规则摘要（只列诉求、工具、结论），不让整轮失败；
+  - 新事件 `compact`，带 `before` / `after` / `folded`。
+- **会话持久化**：`~/.feima/sessions/<时间戳>-<随机4位>.jsonl`，append-only，随消息流同步落盘。
+  - `feima resume [id|last]` 恢复并继续；`feima sessions` 列表、`sessions rm <id>` 删除；
+  - 恢复时系统提示用当前配置重新生成，不沿用旧会话里那条；
+  - `--no-save` / `FEIMA_NO_SAVE=1` 关闭。
+- `AgentLoop.restore()` / `compactNow()` / `onRecord` 钩子；`getSnapshot()` 增加 `contextTokens` 与 `compactions`。
+- 斜杠命令：`/context` `/compact` `/new` `/resume` `/sessions`。
+- 配置项：`contextBudget`、`keepRecentTurns`、`saveSession`，对应 `FEIMA_CONTEXT_BUDGET` / `FEIMA_KEEP_TURNS` / `FEIMA_NO_SAVE`。
+- `doctor` 报告会话目录数量、上下文预算与会话保存状态。
+
+### 修复
+
+- **崩溃后新记录也读不到**：残行没有结尾换行，append 把新记录粘在残行后，两条一起成为坏行。改为 append 前检查末字节，不是换行先补一个。
+- **会话列表永远显示「未命名会话」**：标题只更新了内存 meta，文件首行没改。改为标题确定后重写首行。
+- **列表时间早 8 小时**：`toISOString()` 是 UTC 却被直接截断显示。改为显示层转本地时间，文件内仍存 UTC 以便排序。
+- **RPC 宿主没有压缩**：只在 CLI 挂压缩会导致同一段历史在桌面端表现为另一套行为。RPC 构造处补齐同样的策略。
+
+### 变更
+
+- 事件类型从 9 种增加到 10 种（新增 `compact`），其余不变。
+- `LoopOptions` 增加可选的 `compaction` 与 `onRecord`，不传则行为与 v0.1 一致。
+- 所有消息写入收敛到 `AgentLoop.push()`，避免出现「历史里有、会话文件里没有」的偏差。
+
+### 已知限制
+
+- 进程级隔离仍未实现，`policy` 模式下命令有真实系统权限，`strict` 模式因无后端拒绝执行。
+- 压缩只在每轮请求前检查，单轮内超长工具链不会中途压缩。
+- 会话无索引，`sessions` 扫目录读首行，数百个以内无感。
+- 摘要质量依赖模型；弱模型可能漏掉路径，靠保留轮次兜底。
+
+### 测试
+
+38 例（策略 7 / 循环 10 / 执行 4 / 压缩 8 / 会话 9），全部离线运行。
+
 ## v0.1.0 — 2026-11-08
 
 首个可运行版本。立项与实现同一天完成。
