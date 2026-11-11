@@ -15,6 +15,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import { validateHistoryRecord } from "../src/metrics/report.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.resolve(here, "..");
@@ -38,19 +39,35 @@ if (!fs.existsSync(historyFile)) {
   process.exit(0);
 }
 
+const bad = [];
 const rows = fs
   .readFileSync(historyFile, "utf8")
   .split("\n")
   .filter((l) => l.trim())
   .map((l, i) => {
+    let rec;
     try {
-      return JSON.parse(l);
+      rec = JSON.parse(l);
     } catch {
       console.log(`第 ${i + 1} 行不是合法 JSON，已跳过`);
       return null;
     }
+    const problems = validateHistoryRecord(rec);
+    if (problems.length) bad.push({ line: i + 1, problems });
+    return rec;
   })
   .filter(Boolean);
+
+// 口径不对就停：继续打表等于把「字段名改了」显示成「这版变便宜了」
+if (bad.length) {
+  console.log(`\n有 ${bad.length} 行记录的字段口径不对，趋势表会缺数据：`);
+  for (const b of bad) {
+    console.log(`  第 ${b.line} 行`);
+    for (const p of b.problems) console.log(`    · ${p}`);
+  }
+  console.log("修法是让写入方（scripts/e2e.mjs）按同一个口径写，不要手改历史行骗过检查。");
+  process.exit(1);
+}
 
 if (!rows.length) {
   console.log("记录文件是空的");

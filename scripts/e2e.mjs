@@ -21,7 +21,7 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
-import { formatRate, summarizeRun } from "../src/metrics/report.ts";
+import { formatRate, summarizeRun, validateHistoryRecord } from "../src/metrics/report.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.resolve(here, "..");
@@ -393,8 +393,16 @@ if (saveHistory) {
         ...(r.ok ? {} : { error: r.error }),
       })),
     };
-    fs.appendFileSync(historyFile, `${JSON.stringify(record)}\n`, "utf8");
-    console.log(`记录已追加：${path.relative(repo, historyFile)}（npm run e2e:trend 看趋势）`);
+    // 写之前先过一遍口径校验：坏记录进了 jsonl，趋势表会安静地打空格子，
+    // 而「这版变便宜了」和「这版字段名改了」在屏幕上长得一样
+    const problems = validateHistoryRecord(record);
+    if (problems.length) {
+      console.log("记录未写入：字段口径不对 ——");
+      for (const p of problems) console.log(`  · ${p}`);
+    } else {
+      fs.appendFileSync(historyFile, `${JSON.stringify(record)}\n`, "utf8");
+      console.log(`记录已追加：${path.relative(repo, historyFile)}（npm run e2e:trend 看趋势）`);
+    }
   } catch (err) {
     console.log(`记录写入失败（不影响结论）：${err instanceof Error ? err.message : String(err)}`);
   }

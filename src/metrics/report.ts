@@ -179,3 +179,70 @@ export function compareRuns(before: RunMetrics, after: RunMetrics): Delta[] {
     { label: "耗时ms", before: before.wallMs || null, after: after.wallMs || null, higherIsBetter: false },
   ];
 }
+
+/** totals 里每一项都必须是数字，缺一个趋势表就少一列 */
+const HISTORY_TOTALS_KEYS = [
+  "steps",
+  "rounds",
+  "toolCalls",
+  "toolOk",
+  "toolFail",
+  "blocked",
+  "retries",
+  "totalTokens",
+] as const;
+
+/**
+ * 校验 e2e/history.jsonl 的一条记录，返回问题清单（空数组 = 合格）。
+ *
+ * 为什么值得单独一个函数：写入方是 scripts/e2e.mjs，读的一方是趋势表和人。
+ * 字段名漂移的后果不是报错，而是趋势表安静地打一排空格子——「这版变便宜了」
+ * 和「这版字段名改了」在屏幕上长得一模一样。三个地方（写、读、单测）都调它，
+ * 口径只有一处。
+ */
+export function validateHistoryRecord(value: unknown): string[] {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return ["记录不是对象；期望 { at, version, rev, totals, scenarios }"];
+  }
+  const r = value as Record<string, unknown>;
+  const problems: string[] = [];
+
+  // 最常见的漂移：totals 写成 total、rev 写成 commit
+  const aliases: Array<[string, string]> = [
+    ["total", "totals"],
+    ["commit", "rev"],
+  ];
+  for (const [wrong, right] of aliases) {
+    if (wrong in r && !(right in r)) {
+      problems.push(`字段名对不上：读到 ${wrong}，期望 ${right}（趋势表按 ${right} 取值，改名会让整列变空）`);
+    }
+  }
+
+  if (typeof r.at !== "string" || Number.isNaN(Date.parse(r.at))) {
+    problems.push(`at 不是可解析的时间（读到 ${JSON.stringify(r.at)}）；期望 ISO 时间串`);
+  }
+  if (typeof r.version !== "string" || !r.version.trim()) {
+    problems.push("version 缺失或为空；期望形如 0.7.0");
+  }
+  if (typeof r.rev !== "string") {
+    problems.push("rev 缺失；期望提交号字符串，取不到时写空串，别省掉这个字段");
+  }
+
+  const t = r.totals;
+  if (typeof t !== "object" || t === null || Array.isArray(t)) {
+    problems.push("totals 缺失或不是对象；趋势表的步数、被拦、token 全从它取");
+  } else {
+    const tt = t as Record<string, unknown>;
+    for (const k of HISTORY_TOTALS_KEYS) {
+      if (typeof tt[k] !== "number" || Number.isNaN(tt[k])) {
+        problems.push(`totals.${k} 应为数字，实际是 ${JSON.stringify(tt[k])}`);
+      }
+    }
+  }
+
+  if (!Array.isArray(r.scenarios)) {
+    problems.push("scenarios 应为数组；跑失败时也要写，哪怕是空数组");
+  }
+
+  return problems;
+}
