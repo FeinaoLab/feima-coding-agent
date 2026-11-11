@@ -96,6 +96,7 @@ await step("工具链：write_file 落盘 + bash 真执行", async () => {
     callTool("bash", { command: "echo feima-smoke" }),
     say("完成"),
   ]);
+  const events = [];
   const loop = new AgentLoop({
     provider,
     model: "smoke",
@@ -104,6 +105,7 @@ await step("工具链：write_file 落盘 + bash 真执行", async () => {
     exec: sandbox.exec,
     systemPrompt: "冒烟测试",
     maxTurns: 8,
+    onEvent: (e) => events.push(e),
   });
 
   const outcome = await loop.submit("写个文件，再跑一条命令");
@@ -116,6 +118,14 @@ await step("工具链：write_file 落盘 + bash 真执行", async () => {
   const bashResult = toolResults(provider).find((t) => t.startsWith("退出码"));
   assert(bashResult, `命令没有真执行，拿到的工具结果：${toolResults(provider).join(" | ").slice(0, 200)}`);
   assert(/退出码 0/.test(bashResult), `命令退出码不为 0：${bashResult.slice(0, 120)}`);
+
+  // 步数是端到端趋势的主指标，掉了就没人知道「这一版变贵了没有」
+  const steps = events.filter((e) => e.type === "step");
+  assert(steps.length === 3, `应当有 3 次模型往返（两次工具 + 一次收尾），实际 ${steps.length}`);
+  assert(
+    steps.map((e) => e.toolCalls).join(",") === "1,1,0",
+    `每步的工具数应当是 1,1,0，实际 ${steps.map((e) => e.toolCalls).join(",")}`,
+  );
   await sandbox.dispose();
 });
 

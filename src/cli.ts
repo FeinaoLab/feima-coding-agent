@@ -37,7 +37,7 @@ import { startRpcHost } from "./rpc/host.ts";
 import { parseFlags } from "./cli/flags.ts";
 import type { AgentEvent, ChatMessage } from "./types.ts";
 
-const VERSION = "0.6.0";
+const VERSION = "0.7.0";
 
 interface Runtime {
   config: ReturnType<typeof loadConfig>;

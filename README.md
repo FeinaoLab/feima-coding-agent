@@ -325,9 +325,12 @@ src/
   safety/confirm.ts   副作用确认（模式、参数摘要、脱敏）
   safety/allowlist.ts 命令白名单（切分、前缀匹配、拒绝元字符）
   rpc/host.ts         JSONL 协议宿主
-tests/                node:test，163 个用例
+  metrics/report.ts   一次运行的量化画像（步数 / 工具 / 被拦 / token）
+tests/                node:test，175 个用例
 scripts/smoke.mjs    离线冒烟：七场景，约 3 秒
-scripts/e2e.mjs      端到端：真模型跑三场景，约 2 分钟
+scripts/e2e.mjs      端到端：真模型跑四场景，约 3 分钟，跑完记一行账
+scripts/e2e-trend.mjs 趋势表：读 e2e/history.jsonl
+e2e/history.jsonl    每次端到端的数字（没有正文，可以进仓库）
 docs/                 立项书、架构、路线图、决策记录
 EVOLUTION.md          版本演进台账
 ```
@@ -335,10 +338,11 @@ EVOLUTION.md          版本演进台账
 ## 开发
 
 ```bash
-npm test          # 163 个用例，全部离线，不联网
+npm test          # 175 个用例，全部离线，不联网
 npm run smoke     # 离线冒烟：七场景跑完整链路，约 3 秒
 npm run typecheck # tsc --noEmit（typescript 是开发依赖）
-npm run e2e       # 真模型跑三场景（要本机有模型，约 2 分钟，不进 CI）
+npm run e2e       # 真模型跑四场景（要本机有模型，约 3 分钟，不进 CI）
+npm run e2e:trend # 看趋势：步数 / 工具成功率 / 被拦 / token 比上次多还是少
 npm run doctor
 ```
 
@@ -350,6 +354,8 @@ npm run doctor
 | `npm run smoke` | 装起来还能不能用（假 provider 驱动真工具） | 提交前 |
 | `npm run typecheck` | 类型与导入路径一致性 | 提交前 |
 | `npm run e2e` | 真模型能不能干活、拒绝理由它读不读得懂 | 动提示词 / 工具描述 / 拒绝文案后 |
+
+端到端每次跑完会往 `e2e/history.jsonl` 追一行数字：步数、工具成功/失败、被拦、重试、token、耗时。`npm run e2e:trend` 把它读成表，括号里是与上一次的差——**步数和 token 变少就是省**。它不做判定，只回答「比上次好没有」；`--only` 跑过的部分运行会标 `partial`，不会混进整轮的合计里比。
 
 Node 的类型擦除只删类型、不检查类型，所以**类型检查与用例是两件事，都需要**。v0.1～v0.4 的 `typecheck` 脚本因为没装 `typescript` 而一直空转（`npx` 找不到包时只打印一句提示并以 0 退出），那四个版本里「类型检查通过」都不成立；v0.5 补上依赖，第一次真跑就报出 20 个问题。教训写在 `AGENTS.md`：**新增任何检查手段，先证明它在故意写错时确实会红。**
 

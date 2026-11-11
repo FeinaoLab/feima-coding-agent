@@ -21,6 +21,7 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import { formatRate, summarizeRun } from "../src/metrics/report.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.resolve(here, "..");
@@ -34,6 +35,12 @@ const perRunTimeout = Number(process.env.FEIMA_E2E_TIMEOUT ?? 300_000);
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "feima-e2e-"));
 const results = [];
 let failures = 0;
+/** 最近一次 run 的量化画像，由 runFeima 填；scenario 收进 results 用 */
+let lastMetrics = null;
+
+/** 每次跑完追加一行，攒成趋势；--no-save 时不写 */
+const historyFile = path.join(repo, "e2e", "history.jsonl");
+const saveHistory = !process.argv.includes("--no-save");
 
 function width(s) {
   return [...s].reduce((n, ch) => n + (ch.codePointAt(0) > 0x2e80 ? 2 : 1), 0);
@@ -55,16 +62,37 @@ const only = (() => {
 async function scenario(name, fn) {
   if (only && !name.includes(only)) return;
   const started = Date.now();
+  lastMetrics = null;
   try {
     await fn();
-    results.push({ name, ok: true, ms: Date.now() - started });
-    console.log(`\x1b[32m✓\x1b[0m ${name} ${Date.now() - started} ms`);
+    const ms = Date.now() - started;
+    results.push({ name, ok: true, ms, metrics: lastMetrics });
+    console.log(`\x1b[32m✓\x1b[0m ${name} ${ms} ms`);
+    if (lastMetrics) console.log(`    ${metricLine(lastMetrics)}`);
   } catch (err) {
     failures++;
+    const ms = Date.now() - started;
     const message = err instanceof Error ? err.message : String(err);
-    results.push({ name, ok: false, ms: Date.now() - started, error: message });
-    console.log(`\x1b[31m✗\x1b[0m ${name} ${Date.now() - started} ms\n    ${message}`);
+    results.push({ name, ok: false, ms, error: message, metrics: lastMetrics });
+    console.log(`\x1b[31m✗\x1b[0m ${name} ${ms} ms\n    ${message}`);
+    if (lastMetrics) console.log(`    ${metricLine(lastMetrics)}`);
   }
+}
+
+/** 一行读完一次运行的量化结果；口径与 src/metrics/report.ts 一致 */
+function metricLine(m) {
+  const tokens = m.totalTokens ? `${m.totalTokens} token` : "token 未报";
+  return [
+    `往返 ${m.steps}`,
+    `轮次 ${m.rounds}`,
+    `工具 ${m.toolOk}/${m.toolCalls}（${formatRate(m)}）`,
+    `被拦 ${m.blocked}`,
+    `其他失败 ${m.failedOther}`,
+    `重试 ${m.retries}`,
+    tokens,
+    `${m.wallMs} ms`,
+    m.ended === "settled" ? "正常收尾" : m.ended,
+  ].join(" · ");
 }
 
 function writeFixture(dir, files) {
@@ -91,6 +119,7 @@ async function runFeima(workspace, task, extra = [], extraEnv = {}) {
   delete env.FEIMA_YES;
   delete env.FEIMA_SYSTEM_EXTRA;
 
+  const startedAt = Date.now();
   const child = spawn(process.execPath, args, { cwd: repo, env });
   const events = [];
   let stdout = "";
@@ -103,20 +132,35 @@ async function runFeima(workspace, task, extra = [], extraEnv = {}) {
   }, perRunTimeout);
 
   await new Promise((resolve) => {
+    // 按块切行一定要留余量：一行 JSON 可能正好被切在两个 chunk 之间，
+    // 不缓冲就会整条丢掉——丢的往往是 tool_end，指标跟着少算一次。
+    let pending = "";
     child.stdout.on("data", (b) => {
       const text = b.toString("utf8");
       stdout += text;
-      for (const line of text.split("\n")) {
+      pending += text;
+      const lines = pending.split("\n");
+      pending = lines.pop() ?? "";
+      for (const line of lines) {
         if (!line.trim().startsWith("{")) continue;
         try {
           events.push(JSON.parse(line));
         } catch {
-          /* 半行：等下一块数据补齐，这里丢弃不会影响结论 */
+          /* 真解析不了就丢：宁可少一条，也不要因为半行把整轮判死 */
         }
       }
     });
     child.stderr.on("data", (b) => (stderr += b.toString("utf8")));
-    child.on("close", (code) => resolve(code));
+    child.on("close", () => {
+      if (pending.trim().startsWith("{")) {
+        try {
+          events.push(JSON.parse(pending));
+        } catch {
+          /* 同上 */
+        }
+      }
+      resolve();
+    });
   });
   clearTimeout(timer);
 
@@ -127,19 +171,16 @@ async function runFeima(workspace, task, extra = [], extraEnv = {}) {
     .map((e) => e.text)
     .join("");
   const reasoning = events.filter((e) => e.type === "reasoning_delta").length;
-  return { events, starts, ends, text, reasoning, stdout, stderr, timedOut };
+  const metrics = summarizeRun(events, Date.now() - startedAt);
+  lastMetrics = metrics;
+  return { events, starts, ends, text, reasoning, stdout, stderr, timedOut, metrics };
 }
 
 /** 某类工具的成功/失败次数，用来写断言 */
 const count = (ends, name, ok) =>
   ends.filter((e) => e.name === name && (ok === undefined || e.ok === ok)).length;
 
-const summarize = (r) =>
-  [
-    `工具 ${r.starts.length} 次（成功 ${r.ends.filter((e) => e.ok).length}）`,
-    `思考块 ${r.reasoning}`,
-    `text ${r.text.length} 字`,
-  ].join(" · ");
+const summarize = (r) => [`思考块 ${r.reasoning}`, `text ${r.text.length} 字`].join(" · ");
 
 function printCalls(r) {
   for (const e of r.ends) {
@@ -295,15 +336,69 @@ await scenario("确认闸门：非交互无 --yes 时写不进去，且理由不
 });
 
 // —— 汇总 ——
+const total = results.reduce(
+  (acc, r) => {
+    const m = r.metrics;
+    if (m) {
+      acc.steps += m.steps;
+      acc.rounds += m.rounds;
+      acc.toolCalls += m.toolCalls;
+      acc.toolOk += m.toolOk;
+      acc.toolFail += m.toolFail;
+      acc.blocked += m.blocked;
+      acc.retries += m.retries;
+      acc.totalTokens += m.totalTokens;
+    }
+    return acc;
+  },
+  { steps: 0, rounds: 0, toolCalls: 0, toolOk: 0, toolFail: 0, blocked: 0, retries: 0, totalTokens: 0 },
+);
+
 console.log("\n飞码端到端（真模型）");
-console.log("─".repeat(56));
+console.log("─".repeat(72));
 console.log(`模型 ${model}  ·  ${baseUrl}`);
 for (const r of results) {
-  console.log(`${r.ok ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m"} ${pad(r.name, 46)}${String(r.ms).padStart(6)} ms`);
+  const m = r.metrics;
+  const nums = m ? `${String(m.steps).padStart(3)} 步  ${formatRate(m).padStart(4)}  ${String(m.totalTokens || "-").padStart(6)} tok` : "";
+  console.log(`${r.ok ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m"} ${pad(r.name, 40)}${String(r.ms).padStart(7)} ms  ${nums}`);
   if (!r.ok) console.log(`    ${r.error}`);
 }
-console.log("─".repeat(56));
+console.log("─".repeat(72));
+console.log(
+  `合计 ${total.steps} 步 / ${total.rounds} 轮 · 工具 ${total.toolOk}/${total.toolCalls}（${
+    total.toolCalls ? Math.round((total.toolOk / total.toolCalls) * 100) + "%" : "—"
+  }）· 被拦 ${total.blocked} · 重试 ${total.retries} · ${total.totalTokens || "-"} token`,
+);
 console.log(failures ? `\x1b[31m${failures} 项失败\x1b[0m` : "\x1b[32m全部通过\x1b[0m");
+
+// 记录：只记结论与数字，不记正文——正文里可能有工作区路径与用户内容
+if (saveHistory) {
+  try {
+    fs.mkdirSync(path.dirname(historyFile), { recursive: true });
+    const record = {
+      at: new Date().toISOString(),
+      version: readVersion(),
+      rev: readRev(),
+      model,
+      baseUrl,
+      ok: failures === 0,
+      // --only 只跑了一部分场景，合计不能与整轮相比，趋势表里要标出来
+      partial: Boolean(only),
+      totals: total,
+      scenarios: results.map((r) => ({
+        name: r.name,
+        ok: r.ok,
+        ms: r.ms,
+        metrics: r.metrics,
+        ...(r.ok ? {} : { error: r.error }),
+      })),
+    };
+    fs.appendFileSync(historyFile, `${JSON.stringify(record)}\n`, "utf8");
+    console.log(`记录已追加：${path.relative(repo, historyFile)}（npm run e2e:trend 看趋势）`);
+  } catch (err) {
+    console.log(`记录写入失败（不影响结论）：${err instanceof Error ? err.message : String(err)}`);
+  }
+}
 
 if (failures) {
   console.log(`现场保留在 ${root}`);
@@ -316,3 +411,23 @@ if (failures) {
 }
 
 process.exit(failures ? 1 : 0);
+
+function readVersion() {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(repo, "package.json"), "utf8")).version ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function readRev() {
+  try {
+    const head = fs.readFileSync(path.join(repo, ".git", "HEAD"), "utf8").trim();
+    if (!head.startsWith("ref:")) return head.slice(0, 7);
+    const ref = head.replace("ref:", "").trim();
+    const sha = fs.readFileSync(path.join(repo, ".git", ref), "utf8").trim();
+    return sha.slice(0, 7);
+  } catch {
+    return "";
+  }
+}

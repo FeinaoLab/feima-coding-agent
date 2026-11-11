@@ -101,6 +101,8 @@ export class AgentLoop {
   private steering: string[] = [];
   private followUps: string[] = [];
   private turns = 0;
+  /** 模型往返次数：一次请求 + 一次回复算一步，与用户轮次无关 */
+  private steps = 0;
   private compactions = 0;
   private controller: AbortController | null = null;
   private lastUsage: Usage | null = null;
@@ -463,6 +465,10 @@ export class AgentLoop {
     }
 
     const calls = assembler.list();
+    // 一步 = 一次模型往返。用户轮次（turn）与它不是一个量级：一个「修好这个 bug」
+    // 的任务通常只有 1 轮，但会有 5~10 步。要衡量效率，看的是步数。
+    this.steps += 1;
+    this.emit({ type: "step", index: this.steps, toolCalls: calls.length });
     const message: ChatMessage = {
       role: "assistant",
       content: text.length ? text : null,

@@ -107,6 +107,8 @@ export type AgentEvent =
   /** 上下文被折叠：before/after 是估算 token，folded 是被折叠的消息条数 */
   | { type: "compact"; before: number; after: number; folded: number }
   | { type: "turn_end"; turn: number }
+  /** 模型往返一次（请求→回复）。toolCalls 是这一步要求调用的工具数，0 表示它在收尾 */
+  | { type: "step"; index: number; toolCalls: number }
   /** 请求失败正在重试：只会在「本次尝试没产出任何东西」时出现 */
   | { type: "retry"; attempt: number; delayMs: number; message: string }
   /** 需要提醒用户但不算错误（例如无人工确认下放行了写操作） */

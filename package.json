@@ -1,6 +1,6 @@
 {
   "name": "feima-coding-agent",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "飞码 CodingAgent — 中文优先的终端编程 Agent，零运行时依赖",
   "type": "module",
   "bin": {
@@ -15,7 +15,8 @@
     "smoke": "node scripts/smoke.mjs",
     "e2e": "node scripts/e2e.mjs",
     "dev": "node src/cli.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "e2e:trend": "node scripts/e2e-trend.mjs"
   },
   "files": [
     "bin",
